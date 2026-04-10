@@ -1,0 +1,1 @@
+export { XdrSentryApp } from './app';
