@@ -1,323 +1,144 @@
-# XDR Sentry Agentic AI Strategy for Security Log Investigation
+# XDR Sentry Agentic Investigation Strategy
 
-## 1. Why XDR Sentry (and why now)
-XDR Sentry should be built as a goal-driven investigation system, not a bulk summarizer. The core problem with many AI SOC experiences is that they push large alert sets into an LLM and ask it to "find attacks," which increases hallucination risk, weakens traceability, and reduces analyst trust.
+## 1. Purpose
 
-XDR Sentry should instead use bounded, multi-agent workflows that:
-- start from explicit investigation goals,
-- select and validate evidence in stages,
-- expose uncertainty,
-- require human approval for high-impact actions.
+XDR Sentry is a goal-driven investigation system for structured logs. It is not a bulk alert summarizer and it must not invent an attack narrative from unrelated records.
 
-Investigation execution is agentic and LLM-assisted by design.
-If no LLM provider key is configured, the run must fail fast with a clear validation error instead of silently falling back to non-agentic execution.
-
-Goal selection must support two modes:
-- Human-defined goal: analyst writes the investigation goal directly.
-- Agent-proposed goal: agent suggests goals from external threat intelligence sources plus current OpenSearch index landscape.
+Every run starts from an explicit investigation goal, profiles the selected data before reasoning about attacks, and only reports conclusions that are supported by validated local evidence.
 
-The analyst must always choose which goal to execute.
+## 2. Investigation Contract
 
-## 2. External feedback and market signals
-
-### 2.1 What users appreciate in Attack Discovery
-From Elastic docs and public descriptions, users value:
-- fast correlation-style summaries across many alerts,
-- configurable scope (KQL, time range, count of alerts),
-- integration into case and investigation workflows,
-- saved/scheduled runs for repeatable investigations.
-
-### 2.2 Problems users report with Attack Discovery
-From Elastic community feedback, users reported:
-- token/context length constraints with larger alert volumes,
-- mixed output quality,
-- duplicate/repetitive alert selection in the analysis set,
-- unclear alert selection behavior,
-- desire for tighter control over which alerts are included (status, time windows, host/network focus, manual alert selection).
-
-These are exactly the gaps XDR Sentry should target.
-
-### 2.3 Latest agentic SOC projects to learn from
-- Microsoft Security Copilot agents: role-specific autonomous triage agents, explicit feedback loops, and human-controlled approvals.
-- CrowdStrike Charlotte AI Detection Triage: autonomous detection triage with true/false positive classification, recommended actions, and bounded autonomy.
-- Google SecOps Triage and Investigation Agent (TIN): iterative query refinement, enrichment, and analyst-facing investigation acceleration.
-- Trend Micro Cybertron direction: cyber model + agentic memory + explainable automation for SOC workflows.
-
-## 3. Product principles for XDR Sentry
-1. Goal-first investigation
-Every run starts from a user goal (for example: "validate lateral movement on host X in last 6h"), not from an unbounded prompt.
-
-Goal-first in XDR Sentry means analyst-controlled goal selection, not analyst-only goal creation.
-The platform should allow either:
-- human-authored goals, or
-- agent-suggested goals generated from trusted external sources and local index context.
-
-2. Bounded autonomy
-Agents can plan and execute within policy limits, but disruptive actions always require analyst approval.
-
-3. Evidence-grounded conclusions
-Every conclusion must cite source documents, fields, and query steps.
-
-4. Schema-aware reasoning
-The system must detect ECS compliance level per index and adapt safely to non-ECS fields.
-
-5. Human override everywhere
-Analysts can force include, force exclude, pin entities, or lock mappings at any step.
-
-6. Quality is measured, not assumed
-All runs are scored for evidence coverage, contradiction risk, and analyst acceptance.
-
-## 4. Proposed XDR Sentry multi-agent architecture
-
-### 4.1 Agent roles
-1. Scope Agent
-- Converts analyst intent into an execution plan.
-- Proposes index set, time window, filters, and budget.
-- Supports dual goal input modes: human goal or agent-proposed goal.
-
-2. Goal Discovery Agent
-- Continuously gathers candidate goals from enabled external sources.
-- Reads OpenSearch index names and index-pattern metadata to infer relevant technologies.
-- Produces ranked goal proposals with source citations and confidence.
-
-3. Schema Agent
-- Profiles field availability across selected indices.
-- Builds ECS and non-ECS mapping confidence map.
-
-4. Selection Agent
-- Pulls candidate events/alerts.
-- De-duplicates near-identical records.
-- Clusters events by entities/techniques/timeline.
-
-5. Enrichment Agent
-- Adds context: entity history, threat intel, prior case evidence, baseline behavior.
-
-6. Hypothesis Agent
-- Produces competing hypotheses with confidence and required evidence.
-
-7. Validation Agent
-- Verifies each claim against retrieved evidence.
-- Flags unsupported statements and contradictions.
-
-8. Decision Agent
-- Creates analyst-ready outcomes: likely true positive, likely benign, inconclusive.
-- Proposes next actions and confidence rationale.
-
-### 4.2 Investigation memory model
-- Run memory: ephemeral context for current run.
-- Case memory: persistent context for a single case.
-- Tenant memory: approved mapping packs, playbooks, and policy defaults.
-
-### 4.3 OpenSearch-native execution model
-- Use point-in-time snapshots for consistent long-running investigations.
-- Persist investigation graph in an index: entities, relationships, hypotheses, evidence links, verdicts.
-- Maintain an explainability ledger containing executed queries, tool calls, and evidence references.
-
-## 5. Human-in-the-loop design (high priority)
-
-### 5.1 Human context controls before execution
-Before any run, the analyst can set:
-- indices to include/exclude,
-- time window and event-status filters,
-- max events and cost budget,
-- entity constraints (host, user, process, IP),
-- mandatory evidence sources.
-
-Before execution, the analyst also chooses the goal mode:
-- Use human-authored goal, or
-- Use one of the agent-proposed goals.
-
-Source configuration must be available in both goal modes (human-defined and agent-proposed):
-- enable or disable predefined trusted sources,
-- add custom source URLs,
-- remove outdated custom sources.
-
-In human-defined mode, configured sources are still consumed during Source Intel phase for threat context enrichment.
-In agent-proposed mode, configured sources are used both for goal generation and investigation-time enrichment.
-
-### 5.2 Human control during execution
-- Live plan review: analysts can approve, pause, or edit plan steps.
-- Schema confirmation step: map unknown fields before agents use them.
-- Dedup preview: inspect and override grouped duplicates.
-
-### 5.3 Human approvals after reasoning
-Require approval for:
-- external-side effects outside investigation context,
-- optional endpoint response proposals,
-- persistent detection-content updates.
-
-XDR Sentry MVP should not include case lifecycle management features (open/close/share cases).
-
-## 5.4 External source strategy for agent-proposed goals
-The Goal Discovery Agent should support a source registry with:
-- predefined high-reputation source presets (toggle on/off per source),
-- user-defined custom sources,
-- health checks and freshness timestamps.
-
-Initial predefined source families:
-- major vendor security research blogs,
-- vulnerability advisories and KEV-style feeds,
-- trusted threat-intel and incident writeup sources.
-
-Initial predefined trusted sources (enabled/disabled per source):
-- CISA Known Exploited Vulnerabilities catalog and alerts.
-- NVD / CVE feeds for vulnerability context.
-- US-CERT and equivalent national CERT advisories.
-- Mandiant / Google Cloud Security research.
-- Microsoft Security Blog.
-- CrowdStrike threat research and incident writeups.
-- Palo Alto Networks Unit 42 research.
-- Cisco Talos intelligence updates.
-- Recorded Future or equivalent intelligence reports (if licensed).
-- Curated public repositories of detection and threat content (for example Sigma and ATT&CK-related references).
-
-Custom-source support must allow analysts to:
-- add arbitrary source URLs,
-- tag them by type (news, advisory, blog, repository),
-- set trust level and cadence,
-- disable without deleting.
-
-Each proposed goal must include:
-- source URL(s),
-- publication time,
-- extracted threat theme,
-- mapped candidate technologies observed in local indices.
-
-## 5.5 Dynamic technology inference from OpenSearch indices
-Because index sets change over time, XDR Sentry should periodically discover technologies by:
-- reading current index names and aliases,
-- matching naming patterns (for example cloud, endpoint, identity, firewall, dns, proxy, k8s),
-- validating with sampled field signatures.
-
-This allows the Goal Discovery Agent to suggest goals relevant to what is currently ingested, even when indices are added or removed.
-
-All inferred technologies should be reviewable and editable by the analyst before execution.
-
-## 5.6 LLM provider configuration (OpenAI-compatible)
-XDR Sentry should support OpenAI-compatible APIs with:
-- out-of-the-box presets for NVIDIA-hosted endpoints and Groq Cloud,
-- custom base URL for any OpenAI-compatible provider,
-- user-provided API key.
-
-Security and UX requirements:
-- API key input is masked and never re-displayed in plain text.
-- Store provider configuration securely and scope by tenant/space.
-- Validate connectivity and model list before first run.
-- Support per-run model override when policy allows.
-
-Current MVP implementation note:
-- Configuration save/load is implemented.
-- API key remains input-only in UI displays.
-- Current storage is in-memory server state for MVP and resets on restart.
-- Next hardening step is persistent tenant/space-scoped storage.
-
-## 6. Schema intelligence for ECS and non-ECS data
-
-### 6.1 Field capability registry
-For each index pattern, store:
-- known ECS fields,
-- custom aliases,
-- semantic type confidence,
-- owner-curated mapping notes.
-
-### 6.2 Mapping confidence labels
-Each mapped field receives confidence level:
-- high: exact ECS or validated mapping,
-- medium: inferred mapping with supporting evidence,
-- low: weak/ambiguous mapping.
-
-Low-confidence mappings should reduce final verdict confidence automatically.
-
-### 6.3 Non-ECS safe mode
-If critical fields are missing or inconsistent:
-- split run into sub-investigations by index family,
-- disable high-confidence verdicts,
-- ask analyst to confirm or correct mappings.
-
-## 7. Anti-hallucination and safety controls
-1. Retrieval-only claim policy
-No claim without cited evidence objects.
-
-2. Two-pass validation
-Pass 1 generates findings, pass 2 attempts to disprove findings.
-
-3. Contradiction detector
-Detects inconsistent entity timelines, impossible sequence ordering, or field misuse.
-
-4. Explicit uncertainty output
-Require "unknown" and "insufficient evidence" outcomes when evidence is weak.
-
-5. Prompt and policy versioning
-Every run stores policy version, prompt template version, and toolchain version.
-
-6. Injection-resistant tool sandboxing
-Restrict which tools/indices each agent may access based on role and tenant policy.
-
-## 8. Creative features to differentiate XDR Sentry
-1. Investigation Blueprint Templates
-Goal-specific templates (ransomware, credential abuse, lateral movement, data exfiltration) with pre-validated query plans.
-
-2. Scope Diff and Replay
-Compare two runs and show what changed (scope, evidence, verdict) to reduce analyst confusion.
-
-3. Field Drift Radar
-Continuously detect schema drift across indices and alert admins before investigations degrade.
-
-4. Evidence Density Meter
-Visual signal for how much of each conclusion is supported by high-confidence evidence.
-
-5. Hypothesis Tournament Mode
-Competing hypotheses are ranked by disconfirming evidence, reducing one-track bias.
-
-6. Analyst Coaching Loop
-When analysts override agent output, capture reason codes and use them to improve future ranking and prompts.
-
-7. Cost Guardrails Dashboard
-Show token, query, and runtime budget per run/team/tenant; enforce hard limits.
-
-8. Action Readiness Score
-A score showing whether evidence quality is sufficient to justify containment or escalation.
-
-9. Trust Calibration View
-Track historical precision of the system per detection type and data source.
-
-10. Controlled Auto-Mode
-Allow safe partial automation only for low-risk investigation tasks (evidence packaging, timeline generation, and hypothesis comparison reports).
-
-11. External Threat Pulse to Goal Pipeline
-Continuously convert trusted-source updates into candidate investigation goals aligned to currently active indices.
-
-12. Source Trust Controls
-Per-source toggles, freshness controls, and citation visibility so analysts can decide what outside intelligence influences agent-proposed goals.
-
-## 9. Single MVP roadmap
-
-### MVP scope (single roadmap)
-- Scope Agent + Schema Agent + Selection Agent + Decision Agent.
-- Add Goal Discovery Agent for agent-proposed goals.
-- Manual approvals for all external actions.
-- Evidence-cited findings with confidence labels.
-- Basic dedup, clustering, and index inclusion controls.
-- External source registry with predefined trusted sources and custom source support.
-- Dynamic index-based technology inference for goal relevance.
-- OpenAI-compatible provider config with NVIDIA and Groq presets plus custom URL.
-- KPI instrumentation and shadow mode.
-
-### 9.1 Current MVP behavior snapshot (conversation-aligned)
-- Running an investigation requires a valid goal and an LLM API key.
-- Investigation flow is phase-based (Source Intel, Scope, Schema, Selection, Hypothesis, Validation, Decision).
-- Each phase is executed using predefined backend scripts surfaced as tool calls to the LLM.
-- Workflow graph is interactive; clicking a phase filters logs and shows the phase script purpose/instructions.
-- Live activity log is timestamped and phase-tagged.
-- Goal discovery supports predefined trusted sources plus custom source URLs.
-- Provider configuration supports save/load in MVP (in-memory persistence caveat above).
-
-## 10. Evaluation framework and KPIs
-
-### SOC impact metrics
-- Mean time to first useful investigation output,
-- mean time to investigate,
-- false positive handling efficiency,
+Every investigation follows this order:
+
+1. understand and approve the goal,
+2. identify which indices are available,
+3. determine what each selected index actually contains,
+4. decide whether the data is understandable enough to investigate,
+5. research current relevant threat context,
+6. test local evidence against suspicious and benign explanations,
+7. produce a traceable conclusion.
+
+If the selected data cannot be understood with enough confidence, XDR Sentry must stop clearly instead of forcing a narrative.
+
+## 3. Core Principles
+
+1. Goal first.
+2. Understand the data before reasoning about attacks.
+3. ECS first, but not ECS only.
+4. Evidence first, narrative last.
+5. External research generates tests, not conclusions.
+6. Competing hypotheses are mandatory.
+7. Human control remains first-class.
+8. Unknown is a valid outcome.
+
+## 4. Data Understanding Layer
+
+Before threat reasoning begins, XDR Sentry builds an index profile for each selected index or index family.
+
+That profile should answer:
+
+- what the index likely contains,
+- which fields are meaningful,
+- whether it appears fit for investigation,
+- whether it should be investigated together with other indices or split into a separate branch,
+- whether it should be excluded because the data is too ambiguous.
+
+The profile is built from multiple exploratory steps rather than a single sample. At minimum this includes mappings, sampled documents, field population checks, and distributions for meaningful fields or time slices.
+
+## 5. Schema Understanding
+
+XDR Sentry prefers ECS semantics when they are available, but it must also work with non-ECS structured logs when their meaning can be inferred safely.
+
+Each branch keeps an explainable understanding level:
+
+- high confidence: strong ECS alignment or clearly validated semantics,
+- medium confidence: partially inferred but usable semantics,
+- low confidence: ambiguous or unsafe semantics.
+
+Low-confidence branches should either be isolated from the rest of the investigation or stopped entirely if the goal depends on missing concepts such as time, action, source, destination, process, or user.
+
+## 6. External Research Layer
+
+External research is mandatory but subordinate to local evidence.
+
+Research should:
+
+- derive topics from the approved goal and detected technologies,
+- use trusted and current sources,
+- identify current attacks, campaigns, vulnerabilities, and behaviours,
+- turn those findings into local tests and questions.
+
+External context must never be used by itself to claim that an attack occurred.
+
+## 7. Evidence And Hypothesis Testing
+
+XDR Sentry converts data understanding plus external research into explicit suspicious and benign hypotheses.
+
+The investigation layer then:
+
+- collects bounded evidence,
+- pivots across hosts, users, IPs, containers, services, or other meaningful entities,
+- builds focused timelines,
+- challenges leading hypotheses with contradictions and missing expected evidence,
+- ranks explanations by evidentiary strength.
+
+Every major claim must remain linked to concrete evidence cards and the index branch that produced them.
+
+## 8. Decision Model
+
+Allowed final states are:
+
+- Likely attack story identified
+- Correlated activity identified but attack not established
+- No supported attack story found in scope
+- Inconclusive
+- Unable to proceed
+
+The distinction between the last two matters:
+
+- Inconclusive means the investigation ran, but the evidence remained weak, partial, or contradictory.
+- Unable to proceed means the logs were not understandable enough for a reliable investigation in the first place.
+
+## 9. Agent Roles
+
+1. Goal Agent
+2. Index Understanding Agent
+3. Research Agent
+4. Correlation Agent
+5. Hypothesis Agent
+6. Challenger Agent
+7. Decision Agent
+8. Reporting Agent
+
+These roles follow the ordered workflow and exist to prevent the system from jumping straight to storytelling.
+
+## 10. Investigation State And Retrieval
+
+Each run should produce a compact set of investigation records:
+
+- run record,
+- index profile,
+- research note,
+- evidence card,
+- hypothesis record,
+- decision record,
+- audit record.
+
+Retrieval for later stages should remain layered and focused. Reporting should read validated evidence and explicit limitations, not large raw log dumps.
+
+## 11. Reporting Contract
+
+Every report includes:
+
+- the investigation goal,
+- the indices used,
+- what each relevant index appeared to contain,
+- the main supporting evidence,
+- key limitations or contradictions,
+- the reason for the selected final state,
+- recommended next actions.
+
+If the investigation splits into branches, XDR Sentry reports a branch-level conclusion and an overall synthesis. The final explanation must only use validated evidence.
 - analyst acceptance rate of recommendations,
 - investigation rerun rate due to missing context.
 
