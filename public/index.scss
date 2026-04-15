@@ -51,9 +51,7 @@
 .xdrSentryHero__content {
   position: relative;
   z-index: 1;
-  display: grid;
-  grid-template-columns: 2fr 1fr;
-  gap: 32px;
+  display: block;
   padding: 32px;
 }
 
@@ -71,26 +69,6 @@
   font-size: 34px;
   line-height: 1.05;
   letter-spacing: -0.03em;
-}
-
-.xdrSentryHero__subtitle {
-  max-width: 72ch;
-  margin: 14px 0 0;
-  color: var(--xdr-sentry-muted);
-  font-size: 16px;
-  line-height: 1.6;
-}
-
-.xdrSentryHero__stats {
-  display: grid;
-  gap: 12px;
-}
-
-.xdrSentryHero__stats .euiStat {
-  border: 1px solid rgba(30, 94, 255, 0.12);
-  border-radius: 20px;
-  background: rgba(255, 255, 255, 0.78);
-  padding: 18px;
 }
 
 .xdrSentryStrategyGrid,
@@ -159,7 +137,6 @@
 }
 
 .xdrSentryRoleRow,
-.xdrSentrySourceRow,
 .xdrSentryHistoryRow,
 .xdrSentryCustomSource,
 .xdrSentryFeedItem {
@@ -175,6 +152,49 @@
 .xdrSentryFeedItem:last-child,
 .xdrSentryHistoryRow:last-child {
   border-bottom: 0;
+}
+
+.xdrSentrySourceTable {
+  border: 1px solid rgba(15, 23, 32, 0.1);
+  border-radius: 16px;
+  overflow: hidden;
+}
+
+.xdrSentrySourceTable__head,
+.xdrSentrySourceTable__row {
+  display: grid;
+  grid-template-columns: minmax(180px, 1.4fr) 92px minmax(220px, 2fr) 80px 84px;
+  gap: 12px;
+  align-items: center;
+  padding: 10px 12px;
+}
+
+.xdrSentrySourceTable__head {
+  background: #f0f5f8;
+  border-bottom: 1px solid rgba(15, 23, 32, 0.1);
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--xdr-sentry-muted);
+  font-weight: 700;
+}
+
+.xdrSentrySourceTable__row {
+  border-bottom: 1px solid rgba(15, 23, 32, 0.08);
+}
+
+.xdrSentrySourceTable__row:last-child {
+  border-bottom: 0;
+}
+
+.xdrSentrySourceCell__name {
+  color: var(--xdr-sentry-ink);
+}
+
+.xdrSentrySourceCell__url {
+  color: var(--xdr-sentry-muted);
+  font-size: 12px;
+  word-break: break-all;
 }
 
 .xdrSentryRecordGrid {
@@ -231,6 +251,69 @@
   gap: 10px;
   flex-wrap: wrap;
   justify-content: flex-end;
+}
+
+.xdrSentryMissionHeader {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.xdrSentryMissionHeader__actions {
+  flex: 0 0 auto;
+}
+
+.xdrSentryGoalLayout {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 12px;
+  align-items: start;
+}
+
+.xdrSentryGoalLayout__main {
+  min-width: 0;
+}
+
+.xdrSentryGoalLayout__thinking {
+  width: 100%;
+  justify-self: start;
+}
+
+.xdrSentryThinkingPanel {
+  border: 1px solid rgba(15, 23, 32, 0.08);
+}
+
+.xdrSentryThinkingLog {
+  height: 252px;
+  overflow-y: auto;
+  padding-right: 6px;
+}
+
+.xdrSentryThinkingLog__line {
+  margin: 0 0 8px;
+  font-size: 14px;
+  line-height: 1.5;
+  font-family: 'IBM Plex Sans', 'Aptos', 'Segoe UI', sans-serif;
+  color: var(--xdr-sentry-muted);
+  overflow-wrap: anywhere;
+}
+
+.xdrSentryThinkingLog__line--placeholder {
+  opacity: 0.82;
+}
+
+.xdrSentryThinkingLog__line--pending {
+  color: var(--xdr-sentry-ink);
+  font-weight: 500;
+}
+
+.xdrSentryThinkingLog__emoji {
+  margin-right: 6px;
+}
+
+.xdrSentryThinkingLog__line:last-child {
+  margin-bottom: 0;
 }
 
 .xdrSentryGoalOption,
@@ -511,6 +594,7 @@
 }
 
 @media (max-width: 820px) {
+  .xdrSentryMissionHeader,
   .xdrSentryToolbar {
     flex-direction: column;
     align-items: stretch;
@@ -520,8 +604,47 @@
     justify-content: stretch;
   }
 
+  .xdrSentryGoalLayout {
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  }
+
+  .xdrSentryGoalLayout__thinking {
+    width: 100%;
+    justify-self: start;
+  }
+
   .xdrSentryGraphRail,
   .xdrSentryGraphColumns {
     grid-template-columns: repeat(8, minmax(220px, 1fr));
+  }
+
+  .xdrSentrySourceTable {
+    border: 0;
+  }
+
+  .xdrSentrySourceTable__head {
+    display: none;
+  }
+
+  .xdrSentrySourceTable__row {
+    grid-template-columns: 1fr;
+    gap: 6px;
+    border: 1px solid rgba(15, 23, 32, 0.1);
+    border-radius: 12px;
+    margin-bottom: 8px;
+  }
+}
+
+@media (max-width: 700px) {
+  .xdrSentryGoalLayout {
+    grid-template-columns: 1fr;
+  }
+
+  .xdrSentryGoalLayout__thinking {
+    min-width: 0;
+  }
+
+  .xdrSentryThinkingLog {
+    height: 220px;
   }
 }

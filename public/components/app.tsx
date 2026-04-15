@@ -1,13 +1,20 @@
-import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   EuiBadge,
   EuiButton,
   EuiButtonEmpty,
+  EuiButtonIcon,
   EuiCallOut,
   EuiCodeBlock,
+  EuiFieldSearch,
   EuiFieldText,
   EuiFlexGroup,
   EuiFlexItem,
+  EuiFlyout,
+  EuiFlyoutBody,
+  EuiFlyoutFooter,
+  EuiFlyoutHeader,
+  EuiForm,
   EuiFormRow,
   EuiHorizontalRule,
   EuiLoadingSpinner,
@@ -18,7 +25,7 @@ import {
   EuiRadio,
   EuiSelect,
   EuiSpacer,
-  EuiStat,
+  EuiSuperDatePicker,
   EuiSwitch,
   EuiTab,
   EuiTabs,
@@ -66,9 +73,33 @@ interface SuggestedGoal {
   scopeHint?: string[];
 }
 
+interface ProviderConfigView {
+  preset: string;
+  baseUrl: string;
+  model: string;
+  hasApiKey: boolean;
+}
+
+interface GoalGenerationTrace {
+  mode: string;
+  protocol?: string;
+  endpoint?: string;
+  assistantSummary?: string;
+}
+
+interface ProviderTestLogEntry {
+  testedAt: string;
+  protocol: string;
+  endpoint: string;
+  latencyMs: number;
+  thinkingSummary: string[];
+  response: string;
+}
+
 type AppTabId = 'strategy' | 'investigation' | 'history';
 
 const DEFAULT_GOAL = 'Inspect Docker-related logs for signs of exploitation, daemon abuse, or post-compromise behavior.';
+const DEFAULT_PROVIDER_MODEL = 'qwen3.5:9b-q4_K_M';
 
 function getOutcomeColor(state: string): 'success' | 'warning' | 'danger' | 'primary' | 'hollow' {
   if (state === 'Likely attack story identified') {
@@ -132,6 +163,22 @@ export const XdrSentryApp: React.FC<Props> = ({ http, notifications }) => {
   const [selectedGoalId, setSelectedGoalId] = useState('');
   const [suggestedGoals, setSuggestedGoals] = useState<SuggestedGoal[]>([]);
   const [researchSignals, setResearchSignals] = useState<any[]>([]);
+  const [goalGenerationTrace, setGoalGenerationTrace] = useState<GoalGenerationTrace | null>(null);
+
+  const [providerConfig, setProviderConfig] = useState<ProviderConfigView>({
+    preset: 'custom',
+    baseUrl: '',
+    model: DEFAULT_PROVIDER_MODEL,
+    hasApiKey: false,
+  });
+  const [providerBaseUrlInput, setProviderBaseUrlInput] = useState('');
+  const [providerModelInput, setProviderModelInput] = useState(DEFAULT_PROVIDER_MODEL);
+  const [providerApiKeyInput, setProviderApiKeyInput] = useState('');
+  const [providerTestLog, setProviderTestLog] = useState<ProviderTestLogEntry | null>(null);
+  const [testingProviderConnection, setTestingProviderConnection] = useState(false);
+  const [loadingProviderConfig, setLoadingProviderConfig] = useState(false);
+  const [savingProviderConfig, setSavingProviderConfig] = useState(false);
+  const [isProviderFlyoutOpen, setIsProviderFlyoutOpen] = useState(false);
 
   const [enabledSourceIds, setEnabledSourceIds] = useState<string[]>([]);
   const [customSources, setCustomSources] = useState<CustomSource[]>([]);
@@ -156,6 +203,45 @@ export const XdrSentryApp: React.FC<Props> = ({ http, notifications }) => {
   const [suggestingGoals, setSuggestingGoals] = useState(false);
   const [buildingPlan, setBuildingPlan] = useState(false);
   const [runningInvestigation, setRunningInvestigation] = useState(false);
+  const [goalSuggestionActivity, setGoalSuggestionActivity] = useState<string[]>([]);
+  const [goalSuggestionPendingLine, setGoalSuggestionPendingLine] = useState('');
+  const [goalSuggestionAutoScroll, setGoalSuggestionAutoScroll] = useState(true);
+  const [providerTestActivity, setProviderTestActivity] = useState<string[]>([]);
+  const suggestGoalsAbortControllerRef = useRef<AbortController | null>(null);
+  const suggestGoalsTickerRef = useRef<number | null>(null);
+  const suggestGoalsStartedAtRef = useRef<number | null>(null);
+  const goalThinkingLogRef = useRef<HTMLDivElement | null>(null);
+
+  const appendGoalSuggestionLog = useCallback((line: string) => {
+    setGoalSuggestionPendingLine('');
+    setGoalSuggestionActivity((previous) => [...previous, line]);
+  }, []);
+
+  const updateGoalSuggestionPendingLine = useCallback((line: string) => {
+    setGoalSuggestionPendingLine(line);
+  }, []);
+
+  const clearSuggestGoalsTicker = useCallback(() => {
+    if (suggestGoalsTickerRef.current !== null) {
+      window.clearInterval(suggestGoalsTickerRef.current);
+      suggestGoalsTickerRef.current = null;
+    }
+  }, []);
+
+  const stopSuggestGoals = useCallback(() => {
+    const elapsedMarker = Math.max(
+      0,
+      Math.round((Date.now() - Number(suggestGoalsStartedAtRef.current ?? Date.now())) / 1000)
+    );
+    if (suggestGoalsAbortControllerRef.current) {
+      suggestGoalsAbortControllerRef.current.abort();
+      suggestGoalsAbortControllerRef.current = null;
+    }
+    clearSuggestGoalsTicker();
+    setGoalSuggestionPendingLine('');
+    setSuggestingGoals(false);
+    appendGoalSuggestionLog(`[${elapsedMarker}s] Goal suggestion stopped by analyst.`);
+  }, [appendGoalSuggestionLog, clearSuggestGoalsTicker]);
 
   const requestBody = useMemo(
     () => ({
@@ -207,6 +293,18 @@ export const XdrSentryApp: React.FC<Props> = ({ http, notifications }) => {
       setAllowedOutcomeStates(response?.allowedOutcomeStates ?? []);
       setRecordTypes(response?.investigationRecordTypes ?? []);
       setHistory(response?.recentInvestigations ?? []);
+      const provider = response?.provider;
+      if (provider) {
+        const normalizedProvider = {
+          preset: provider?.preset ?? 'custom',
+          baseUrl: provider?.baseUrl ?? '',
+          model: provider?.model || DEFAULT_PROVIDER_MODEL,
+          hasApiKey: Boolean(provider?.hasApiKey),
+        };
+        setProviderConfig(normalizedProvider);
+        setProviderBaseUrlInput(normalizedProvider.baseUrl);
+        setProviderModelInput(normalizedProvider.model);
+      }
       setEnabledSourceIds(
         presets.filter((preset: SourcePreset) => preset.enabledByDefault).map((preset: SourcePreset) => preset.id)
       );
@@ -220,6 +318,175 @@ export const XdrSentryApp: React.FC<Props> = ({ http, notifications }) => {
   useEffect(() => {
     loadBootstrap();
   }, [loadBootstrap]);
+
+  const loadProviderConfig = useCallback(async () => {
+    try {
+      setLoadingProviderConfig(true);
+      const response = await http.get('/api/xdr_sentry/provider_config');
+      const provider = response?.provider;
+      const normalizedProvider = {
+        preset: provider?.preset ?? 'custom',
+        baseUrl: provider?.baseUrl ?? '',
+        model: provider?.model || DEFAULT_PROVIDER_MODEL,
+        hasApiKey: Boolean(provider?.hasApiKey),
+      };
+      setProviderConfig(normalizedProvider);
+      setProviderBaseUrlInput(normalizedProvider.baseUrl);
+      setProviderModelInput(normalizedProvider.model);
+    } catch (error: any) {
+      notifications.toasts.addDanger(`Failed to load provider config: ${error?.message ?? 'unknown error'}`);
+    } finally {
+      setLoadingProviderConfig(false);
+    }
+  }, [http, notifications]);
+
+  useEffect(() => {
+    loadProviderConfig();
+  }, [loadProviderConfig]);
+
+  useEffect(() => {
+    return () => {
+      if (suggestGoalsAbortControllerRef.current) {
+        suggestGoalsAbortControllerRef.current.abort();
+      }
+      clearSuggestGoalsTicker();
+    };
+  }, [clearSuggestGoalsTicker]);
+
+  useEffect(() => {
+    if (!goalSuggestionAutoScroll) {
+      return;
+    }
+    const node = goalThinkingLogRef.current;
+    if (!node) {
+      return;
+    }
+    node.scrollTop = node.scrollHeight;
+  }, [goalSuggestionActivity, goalSuggestionAutoScroll, goalSuggestionPendingLine]);
+
+  const handleGoalThinkingScroll = useCallback(() => {
+    const node = goalThinkingLogRef.current;
+    if (!node) {
+      return;
+    }
+    const distanceFromBottom = node.scrollHeight - node.scrollTop - node.clientHeight;
+    setGoalSuggestionAutoScroll(distanceFromBottom <= 12);
+  }, []);
+
+  const saveProviderConfig = async () => {
+    try {
+      setSavingProviderConfig(true);
+      const payload: any = {
+        preset: 'custom',
+        baseUrl: providerBaseUrlInput,
+        model: providerModelInput.trim() || DEFAULT_PROVIDER_MODEL,
+      };
+      if (providerApiKeyInput.trim()) {
+        payload.apiKey = providerApiKeyInput.trim();
+      }
+
+      const response = await http.post('/api/xdr_sentry/provider_config', {
+        body: JSON.stringify(payload),
+      });
+      const provider = response?.provider;
+      const normalizedProvider = {
+        preset: provider?.preset ?? 'custom',
+        baseUrl: provider?.baseUrl ?? '',
+        model: provider?.model || DEFAULT_PROVIDER_MODEL,
+        hasApiKey: Boolean(provider?.hasApiKey),
+      };
+      setProviderConfig(normalizedProvider);
+      setProviderBaseUrlInput(normalizedProvider.baseUrl);
+      setProviderModelInput(normalizedProvider.model);
+      setProviderApiKeyInput('');
+      setIsProviderFlyoutOpen(false);
+      if (provider?.persistenceWarning) {
+        notifications.toasts.addWarning(String(provider.persistenceWarning));
+        notifications.toasts.addSuccess('Provider configuration saved for the current server process.');
+      } else {
+        notifications.toasts.addSuccess('Provider configuration saved persistently.');
+      }
+    } catch (error: any) {
+      notifications.toasts.addDanger(`Failed to save provider config: ${error?.message ?? 'unknown error'}`);
+    } finally {
+      setSavingProviderConfig(false);
+    }
+  };
+
+  const testProviderConnection = async () => {
+    const effectiveBaseUrl = providerBaseUrlInput.trim() || providerConfig.baseUrl;
+    const effectiveModel = providerModelInput.trim() || providerConfig.model || DEFAULT_PROVIDER_MODEL;
+    const hasEffectiveApiKey = Boolean(providerApiKeyInput.trim() || providerConfig.hasApiKey);
+
+    if (!effectiveBaseUrl || !effectiveModel || !hasEffectiveApiKey) {
+      notifications.toasts.addWarning('Enter base URL, model, and API key, or save the provider first so the test can reuse the stored key.');
+      return;
+    }
+
+    const startedAt = Date.now();
+    const phaseMessages = [
+      'Opening provider connection...',
+      'Sending test prompt to model...',
+      'Waiting for streamed reasoning tokens...',
+      'Continuing to collect streamed answer...',
+    ];
+    let phaseIndex = 0;
+    setProviderTestLog(null);
+    setProviderTestActivity(['[0s] Starting provider test.']);
+    const ticker = window.setInterval(() => {
+      phaseIndex += 1;
+      const elapsed = Math.round((Date.now() - startedAt) / 1000);
+      const message = phaseMessages[Math.min(phaseIndex, phaseMessages.length - 1)];
+      setProviderTestActivity((previous) => [...previous, `[${elapsed}s] ${message}`].slice(-24));
+    }, 1400);
+
+    try {
+      setTestingProviderConnection(true);
+      const response = await http.post('/api/xdr_sentry/test_provider', {
+        body: JSON.stringify({
+          baseUrl: providerBaseUrlInput,
+          model: providerModelInput.trim() || DEFAULT_PROVIDER_MODEL,
+          apiKey: providerApiKeyInput.trim(),
+          question: 'Why is the sky blue?',
+        }),
+      });
+      const elapsed = Math.round((Date.now() - startedAt) / 1000);
+      const thinkingLines = Array.isArray(response?.thinkingSummary)
+        ? response.thinkingSummary.map((line: string, index: number) => `[${elapsed}s] thinking ${index + 1}: ${line}`)
+        : [];
+      setProviderTestActivity((previous) =>
+        [
+          ...previous,
+          `[${elapsed}s] Stream completed via ${String(response?.protocol ?? 'unknown protocol')}.`,
+          ...thinkingLines,
+          `[${elapsed}s] response: ${String(response?.response ?? 'No response returned by provider test.').slice(0, 220)}`,
+        ].slice(-28)
+      );
+      setProviderTestLog({
+        testedAt: String(response?.testedAt ?? new Date().toISOString()),
+        protocol: String(response?.protocol ?? 'unknown'),
+        endpoint: String(response?.endpoint ?? 'unknown-endpoint'),
+        latencyMs: Number(response?.latencyMs ?? 0),
+        thinkingSummary: Array.isArray(response?.thinkingSummary) ? response.thinkingSummary : [],
+        response: String(response?.response ?? 'No response returned by provider test.'),
+      });
+      notifications.toasts.addSuccess('Provider connection test completed.');
+    } catch (error: any) {
+      const elapsed = Math.round((Date.now() - startedAt) / 1000);
+      setProviderTestActivity((previous) =>
+        [...previous, `[${elapsed}s] Test failed: ${String(error?.message ?? 'unknown error')}`].slice(-28)
+      );
+      notifications.toasts.addDanger(`Provider connection test failed: ${error?.message ?? 'unknown error'}`);
+    } finally {
+      window.clearInterval(ticker);
+      setTestingProviderConnection(false);
+    }
+  };
+
+  const closeProviderFlyout = () => {
+    setIsProviderFlyoutOpen(false);
+    setProviderApiKeyInput('');
+  };
 
   const toggleSourcePreset = (sourceId: string, checked: boolean) => {
     if (checked) {
@@ -277,20 +544,112 @@ export const XdrSentryApp: React.FC<Props> = ({ http, notifications }) => {
   );
 
   const suggestGoals = async () => {
+    if (!providerConfig.baseUrl.trim() || !providerConfig.hasApiKey) {
+      notifications.toasts.addWarning('Save a valid LLM provider configuration before requesting goal suggestions.');
+      appendGoalSuggestionLog('[0s] Goal suggestion blocked: no valid saved LLM provider configuration.');
+      return;
+    }
+
+    if (suggestingGoals) {
+      return;
+    }
+
+    appendGoalSuggestionLog('---');
+    appendGoalSuggestionLog(`[${new Date().toISOString()}] New goal suggestion run started.`);
+    updateGoalSuggestionPendingLine('[0s] Checking saved LLM provider availability...');
+    try {
+      const availability = await http.get('/api/xdr_sentry/provider_availability');
+      if (!availability?.available) {
+        const reason = String(availability?.reason ?? 'provider availability check failed');
+        appendGoalSuggestionLog(`[0s] Goal suggestion blocked: ${reason}`);
+        notifications.toasts.addDanger(`Cannot start goal suggestion: ${reason}`);
+        return;
+      }
+      appendGoalSuggestionLog(`[0s] Provider reachable at ${String(availability?.endpoint ?? providerConfig.baseUrl)}.`);
+    } catch (error: any) {
+      const reason = String(error?.message ?? 'provider availability check failed');
+      appendGoalSuggestionLog(`[0s] Goal suggestion blocked: ${reason}`);
+      notifications.toasts.addDanger(`Cannot start goal suggestion: ${reason}`);
+      return;
+    }
+
+    const startedAt = Date.now();
+    suggestGoalsStartedAtRef.current = startedAt;
+    const phaseMessages = [
+      'Compiling selected scope and index hints...',
+      'Collecting trusted-source registry research notes...',
+      'Asking LLM for recent and trending threat missions...',
+      'Waiting for LLM goal response...',
+    ];
+    let phaseIndex = 0;
+    const controller = new AbortController();
+    suggestGoalsAbortControllerRef.current = controller;
+    setGoalGenerationTrace(null);
+    setGoalSuggestionAutoScroll(true);
+    appendGoalSuggestionLog('[0s] Goal suggestion started.');
+    appendGoalSuggestionLog('[0s] Compiling selected scope and index hints.');
+    suggestGoalsTickerRef.current = window.setInterval(() => {
+      const elapsed = Math.round((Date.now() - startedAt) / 1000);
+      phaseIndex += 1;
+      if (phaseIndex < phaseMessages.length) {
+        appendGoalSuggestionLog(`[${elapsed}s] ${phaseMessages[phaseIndex]}`);
+        return;
+      }
+      updateGoalSuggestionPendingLine(
+        `[${elapsed}s] Waiting for provider response. Trusted-source context and LLM reasoning may take time.`
+      );
+    }, 1300);
+    const autoStopTimeout = window.setTimeout(() => {
+      if (suggestGoalsAbortControllerRef.current === controller) {
+        controller.abort();
+        suggestGoalsAbortControllerRef.current = null;
+        setGoalSuggestionPendingLine('');
+        appendGoalSuggestionLog('[300s] Goal suggestion timed out while waiting for LLM response.');
+      }
+    }, 300000);
+
     try {
       setSuggestingGoals(true);
       const response = await http.post('/api/xdr_sentry/propose_goals', {
         body: JSON.stringify(requestBody),
+        signal: controller.signal,
       });
       setSuggestedGoals(response?.goals ?? []);
       setResearchSignals(response?.signals ?? []);
       setLandscape(response?.landscape ?? null);
+      setGoalGenerationTrace(response?.goalGenerationTrace ?? null);
+      const elapsed = Math.round((Date.now() - startedAt) / 1000);
+      const goalCount = Array.isArray(response?.goals) ? response.goals.length : 0;
+      const topGoalLines = (response?.goals ?? [])
+        .slice(0, 3)
+        .map((goal: SuggestedGoal, index: number) => `[${elapsed}s] candidate ${index + 1}: ${goal.title}`);
+      const assistantSummary = String(response?.goalGenerationTrace?.assistantSummary ?? '').trim();
+      appendGoalSuggestionLog(`[${elapsed}s] Completed: ${goalCount} goal suggestions generated.`);
+      if (assistantSummary) {
+        appendGoalSuggestionLog(`[${elapsed}s] LLM summary: ${assistantSummary.slice(0, 260)}`);
+      }
+      for (const line of topGoalLines) {
+        appendGoalSuggestionLog(line);
+      }
       if ((response?.goals ?? []).length > 0) {
         setSelectedGoalId(response.goals[0].id);
       }
     } catch (error: any) {
+      const elapsed = Math.round((Date.now() - startedAt) / 1000);
+      if (error?.name === 'AbortError') {
+        appendGoalSuggestionLog(`[${elapsed}s] Goal suggestion aborted before completion.`);
+        return;
+      }
+      appendGoalSuggestionLog(`[${elapsed}s] Goal suggestion failed: ${String(error?.message ?? 'unknown error')}`);
       notifications.toasts.addDanger(`Failed to suggest goals: ${error?.message ?? 'unknown error'}`);
     } finally {
+      window.clearTimeout(autoStopTimeout);
+      clearSuggestGoalsTicker();
+      setGoalSuggestionPendingLine('');
+      if (suggestGoalsAbortControllerRef.current === controller) {
+        suggestGoalsAbortControllerRef.current = null;
+      }
+      suggestGoalsStartedAtRef.current = null;
       setSuggestingGoals(false);
     }
   };
@@ -400,15 +759,6 @@ export const XdrSentryApp: React.FC<Props> = ({ http, notifications }) => {
             <div>
               <p className="xdrSentryEyebrow">Goal-Driven Investigation System</p>
               <h2 className="xdrSentryHero__title">Understand the data first. Only then test attack stories.</h2>
-              <p className="xdrSentryHero__subtitle">
-                The interface is structured like an investigation pipeline: mission setup on the left, execution canvas in the center,
-                and evidence-backed details on the right. The graph is designed to feel closer to GitHub workflow runs than a generic dashboard.
-              </p>
-            </div>
-            <div className="xdrSentryHero__stats">
-              <EuiStat title={formatCount(profileCards.length)} description="Profiled index families" titleSize="m" />
-              <EuiStat title={formatCount(branchCards.length)} description="Active investigation branches" titleSize="m" />
-              <EuiStat title={formatCount(result?.evidenceCards?.length)} description="Evidence cards" titleSize="m" />
             </div>
           </div>
         </EuiPanel>
@@ -505,97 +855,169 @@ export const XdrSentryApp: React.FC<Props> = ({ http, notifications }) => {
                   <h3>Goal and scope</h3>
                 </EuiTitle>
                 <EuiSpacer size="s" />
-                <EuiRadio
-                  id="goal-mode-human"
-                  label="Use a human-authored goal"
-                  checked={goalMode === 'human'}
-                  onChange={() => setGoalMode('human')}
-                />
-                <EuiRadio
-                  id="goal-mode-agent"
-                  label="Use an agent-suggested goal"
-                  checked={goalMode === 'agent'}
-                  onChange={() => setGoalMode('agent')}
-                />
-
+                <div className="xdrSentryMissionHeader">
+                  <EuiText size="s" color="subdued">
+                    <p>Goal discovery uses selected scope plus enabled trusted sources.</p>
+                  </EuiText>
+                  <div className="xdrSentryMissionHeader__actions">
+                    <EuiButton color={suggestingGoals ? 'danger' : 'primary'} onClick={suggestingGoals ? stopSuggestGoals : suggestGoals}>
+                      {suggestingGoals ? 'Stop' : 'Suggest goals'}
+                    </EuiButton>
+                  </div>
+                </div>
                 <EuiSpacer size="m" />
-                {goalMode === 'human' ? (
-                  <EuiFormRow label="Approved investigation goal">
-                    <EuiTextArea
-                      value={humanGoal}
-                      onChange={(event) => setHumanGoal(event.target.value)}
-                      rows={5}
-                      placeholder="Describe the investigation goal."
+                <div className="xdrSentryGoalLayout">
+                  <div className="xdrSentryGoalLayout__main">
+                    <EuiRadio
+                      id="goal-mode-human"
+                      label="Use a human-authored goal"
+                      checked={goalMode === 'human'}
+                      onChange={() => setGoalMode('human')}
                     />
-                  </EuiFormRow>
-                ) : (
-                  <>
-                    <EuiCallOut title="Generate and approve a goal before execution" color="warning" size="s">
-                      <p>Goal suggestions combine the current index landscape with enabled trusted-source research.</p>
-                    </EuiCallOut>
+                    <EuiRadio
+                      id="goal-mode-agent"
+                      label="Use an agent-suggested goal"
+                      checked={goalMode === 'agent'}
+                      onChange={() => setGoalMode('agent')}
+                    />
+
                     <EuiSpacer size="m" />
-                    {suggestedGoals.length === 0 ? (
-                      <EuiText size="s">
-                        <p>No suggestions yet. Run goal discovery after setting source and scope controls.</p>
-                      </EuiText>
+                    {goalMode === 'human' ? (
+                      <EuiFormRow label="Approved investigation goal">
+                        <EuiTextArea
+                          value={humanGoal}
+                          onChange={(event) => setHumanGoal(event.target.value)}
+                          rows={5}
+                          placeholder="Describe the investigation goal."
+                        />
+                      </EuiFormRow>
                     ) : (
-                      suggestedGoals.map((goal) => (
-                        <button
-                          type="button"
-                          key={goal.id}
-                          className={`xdrSentryGoalOption ${selectedGoalId === goal.id ? 'isSelected' : ''}`}
-                          onClick={() => setSelectedGoalId(goal.id)}
-                        >
-                          <div className="xdrSentryGoalOption__header">
-                            <strong>{goal.title}</strong>
-                            <EuiBadge color="hollow">{goal.confidence}</EuiBadge>
-                          </div>
-                          <div className="xdrSentryGoalOption__body">{goal.rationale}</div>
-                          <div className="xdrSentryBadgeCloud">
-                            {(goal.detectedTechnologies ?? []).map((technology) => (
-                              <EuiBadge key={`${goal.id}-${technology}`}>{technology}</EuiBadge>
-                            ))}
-                          </div>
-                        </button>
-                      ))
+                      <>
+                        <EuiCallOut title="Generate and approve a goal before execution" color="warning" size="s">
+                          <p>Goal suggestions combine the current index landscape with enabled trusted-source research.</p>
+                        </EuiCallOut>
+                        {goalGenerationTrace ? (
+                          <>
+                            <EuiSpacer size="s" />
+                            <EuiCallOut title="Goal generation used Agentic AI" color="success" size="s">
+                              <p>Protocol: {goalGenerationTrace.protocol || 'unknown'}.</p>
+                              <p>{goalGenerationTrace.assistantSummary || 'No assistant summary captured.'}</p>
+                            </EuiCallOut>
+                          </>
+                        ) : null}
+                        <EuiSpacer size="m" />
+                        {suggestedGoals.length === 0 ? (
+                          <EuiText size="s">
+                            <p>No suggestions yet. Run goal discovery after setting source and scope controls.</p>
+                          </EuiText>
+                        ) : (
+                          suggestedGoals.map((goal) => (
+                            <button
+                              type="button"
+                              key={goal.id}
+                              className={`xdrSentryGoalOption ${selectedGoalId === goal.id ? 'isSelected' : ''}`}
+                              onClick={() => setSelectedGoalId(goal.id)}
+                            >
+                              <div className="xdrSentryGoalOption__header">
+                                <strong>{goal.title}</strong>
+                                <EuiBadge color="hollow">{goal.confidence}</EuiBadge>
+                              </div>
+                              <div className="xdrSentryGoalOption__body">{goal.rationale}</div>
+                              <div className="xdrSentryBadgeCloud">
+                                {(goal.detectedTechnologies ?? []).map((technology) => (
+                                  <EuiBadge key={`${goal.id}-${technology}`}>{technology}</EuiBadge>
+                                ))}
+                              </div>
+                            </button>
+                          ))
+                        )}
+                      </>
                     )}
-                  </>
-                )}
+                  </div>
+                  <EuiPanel className="xdrSentryThinkingPanel xdrSentryGoalLayout__thinking" color="subdued" paddingSize="s">
+                    <EuiText size="s">
+                      <strong>Goal discovery thinking</strong>
+                    </EuiText>
+                    {suggestingGoals ? (
+                      <>
+                        <EuiSpacer size="s" />
+                        <EuiLoadingSpinner size="m" />
+                      </>
+                    ) : null}
+                    <EuiSpacer size="s" />
+                    <div className="xdrSentryThinkingLog" role="log" aria-live="polite" ref={goalThinkingLogRef} onScroll={handleGoalThinkingScroll}>
+                      {goalSuggestionActivity.length === 0 ? (
+                        <p className="xdrSentryThinkingLog__line xdrSentryThinkingLog__line--placeholder">No goal discovery activity yet.</p>
+                      ) : goalSuggestionActivity.map((line, index) => (
+                        <p className="xdrSentryThinkingLog__line" key={`goal-thinking-${index}`}>
+                          {line}
+                        </p>
+                      ))}
+                      {goalSuggestionPendingLine ? (
+                        <p className="xdrSentryThinkingLog__line xdrSentryThinkingLog__line--pending">
+                          <span className="xdrSentryThinkingLog__emoji" aria-hidden="true">⏳</span> {goalSuggestionPendingLine}
+                        </p>
+                      ) : null}
+                    </div>
+                  </EuiPanel>
+                </div>
 
                 <EuiSpacer size="m" />
                 <EuiTitle size="xs">
                   <h4>Scope compiler</h4>
                 </EuiTitle>
                 <EuiSpacer size="s" />
-                <EuiFormRow label="Include index patterns (comma separated)">
-                  <EuiFieldText value={includePatterns} onChange={(event) => setIncludePatterns(event.target.value)} />
-                </EuiFormRow>
-                <EuiFormRow label="Exclude index patterns (comma separated)">
-                  <EuiFieldText value={excludePatterns} onChange={(event) => setExcludePatterns(event.target.value)} />
-                </EuiFormRow>
                 <EuiFlexGroup gutterSize="s">
                   <EuiFlexItem>
-                    <EuiFormRow label="Time from">
-                      <EuiFieldText value={timeFrom} onChange={(event) => setTimeFrom(event.target.value)} />
+                    <EuiFormRow label="Include index patterns (comma separated)">
+                      <EuiFieldText value={includePatterns} onChange={(event) => setIncludePatterns(event.target.value)} />
                     </EuiFormRow>
                   </EuiFlexItem>
                   <EuiFlexItem>
-                    <EuiFormRow label="Time to">
-                      <EuiFieldText value={timeTo} onChange={(event) => setTimeTo(event.target.value)} />
+                    <EuiFormRow label="Exclude index patterns (comma separated)">
+                      <EuiFieldText value={excludePatterns} onChange={(event) => setExcludePatterns(event.target.value)} />
                     </EuiFormRow>
                   </EuiFlexItem>
                 </EuiFlexGroup>
-                <EuiFormRow label="Query filter">
-                  <EuiFieldText value={queryText} onChange={(event) => setQueryText(event.target.value)} />
-                </EuiFormRow>
                 <EuiFlexGroup gutterSize="s">
                   <EuiFlexItem>
-                    <EuiFormRow label="Max profiles">
+                    <EuiFormRow label="Query filter" helpText="Use your Discover query expression to narrow the evidence scan.">
+                      <EuiFieldSearch
+                        fullWidth
+                        value={queryText}
+                        onChange={(event) => setQueryText(event.target.value)}
+                        placeholder="event.category:process and host.name:prod-*"
+                      />
+                    </EuiFormRow>
+                  </EuiFlexItem>
+                  <EuiFlexItem>
+                    <EuiFormRow label="Time range" helpText="Discover-style picker for investigation time boundaries.">
+                      <EuiSuperDatePicker
+                        start={timeFrom}
+                        end={timeTo}
+                        onTimeChange={({ start, end }) => {
+                          setTimeFrom(start);
+                          setTimeTo(end);
+                        }}
+                        showUpdateButton={false}
+                      />
+                    </EuiFormRow>
+                  </EuiFlexItem>
+                </EuiFlexGroup>
+                <EuiFlexGroup gutterSize="s">
+                  <EuiFlexItem>
+                    <EuiFormRow
+                      label="Max index families to profile"
+                      helpText="Upper bound on how many matched index families will go through full understanding analysis in this run."
+                    >
                       <EuiFieldText value={maxProfiles} onChange={(event) => setMaxProfiles(event.target.value)} />
                     </EuiFormRow>
                   </EuiFlexItem>
                   <EuiFlexItem>
-                    <EuiFormRow label="Max evidence per index">
+                    <EuiFormRow
+                      label="Max sampled evidence docs per index"
+                      helpText="Upper bound of document samples collected from each eligible index family for evidence cards."
+                    >
                       <EuiFieldText value={maxEvidencePerIndex} onChange={(event) => setMaxEvidencePerIndex(event.target.value)} />
                     </EuiFormRow>
                   </EuiFlexItem>
@@ -609,21 +1031,32 @@ export const XdrSentryApp: React.FC<Props> = ({ http, notifications }) => {
                   <h3>Trusted-source registry</h3>
                 </EuiTitle>
                 <EuiSpacer size="s" />
-                {sourcePresets.map((preset) => (
-                  <div className="xdrSentrySourceRow" key={preset.id}>
-                    <div>
-                      <strong>{preset.name}</strong>
-                      <div>{preset.type} | trust {preset.trustLevel}</div>
-                    </div>
-                    <EuiSwitch
-                      compressed
-                      showLabel={false}
-                      label={preset.name}
-                      checked={enabledSourceIds.includes(preset.id)}
-                      onChange={(event) => toggleSourcePreset(preset.id, event.target.checked)}
-                    />
+                <div className="xdrSentrySourceTable" role="table" aria-label="Trusted source registry">
+                  <div className="xdrSentrySourceTable__head" role="row">
+                    <div>Source</div>
+                    <div>Type</div>
+                    <div>URL</div>
+                    <div>Trust</div>
+                    <div>Enabled</div>
                   </div>
-                ))}
+                  {sourcePresets.map((preset) => (
+                    <div className="xdrSentrySourceTable__row" key={preset.id} role="row">
+                      <div className="xdrSentrySourceCell__name"><strong>{preset.name}</strong></div>
+                      <div>{preset.type}</div>
+                      <div className="xdrSentrySourceCell__url">{preset.url}</div>
+                      <div>{preset.trustLevel}</div>
+                      <div>
+                        <EuiSwitch
+                          compressed
+                          showLabel={false}
+                          label={preset.name}
+                          checked={enabledSourceIds.includes(preset.id)}
+                          onChange={(event) => toggleSourcePreset(preset.id, event.target.checked)}
+                        />
+                      </div>
+                    </div>
+                  ))}
+                </div>
 
                 <EuiHorizontalRule margin="m" />
                 <EuiTitle size="xs">
@@ -673,8 +1106,13 @@ export const XdrSentryApp: React.FC<Props> = ({ http, notifications }) => {
                     <h3 className="xdrSentryToolbar__title">{selectedGoal || 'Approve a goal to begin'}</h3>
                   </div>
                   <div className="xdrSentryToolbar__actions">
+                    <EuiButtonIcon
+                      iconType="gear"
+                      aria-label="Open LLM provider settings"
+                      onClick={() => setIsProviderFlyoutOpen(true)}
+                      title="Open LLM provider settings"
+                    />
                     <EuiButton onClick={() => refreshLandscape(true)} isLoading={profiling}>Refresh index understanding</EuiButton>
-                    <EuiButton onClick={suggestGoals} isLoading={suggestingGoals}>Suggest goals</EuiButton>
                     <EuiButton onClick={previewPlan} isLoading={buildingPlan}>Preview plan</EuiButton>
                     <EuiButton fill onClick={runGoalInvestigation} isLoading={runningInvestigation}>Run investigation</EuiButton>
                   </div>
@@ -945,6 +1383,37 @@ export const XdrSentryApp: React.FC<Props> = ({ http, notifications }) => {
 
                   <EuiSpacer size="m" />
                   <EuiPanel className="xdrSentryCard" paddingSize="m">
+                    <p className="xdrSentryEyebrow">LLM execution trace</p>
+                    <div className="xdrSentryReportGrid">
+                      <div>
+                        <strong>Mode</strong>
+                        <p>{result?.llmTrace?.mode ?? 'n/a'}</p>
+                      </div>
+                      <div>
+                        <strong>Protocol and endpoint</strong>
+                        <p>{`${result?.llmTrace?.protocol ?? 'unknown'} | ${result?.llmTrace?.endpoint ?? 'n/a'}`}</p>
+                      </div>
+                      <div>
+                        <strong>Assistant summaries</strong>
+                        <p>
+                          {(result?.llmTrace?.assistantSummaries ?? [])
+                            .map((entry: any) => `${entry.step}. ${entry.summary}`)
+                            .join(' | ') || 'No summaries captured.'}
+                        </p>
+                      </div>
+                      <div>
+                        <strong>Key intermediate decisions</strong>
+                        <p>{(result?.llmTrace?.keyIntermediateDecisions ?? []).join(' | ') || 'No decision trace captured.'}</p>
+                      </div>
+                    </div>
+                    <EuiSpacer size="s" />
+                    <EuiCodeBlock language="json" isCopyable>
+                      {JSON.stringify(result?.llmTrace ?? {}, null, 2)}
+                    </EuiCodeBlock>
+                  </EuiPanel>
+
+                  <EuiSpacer size="m" />
+                  <EuiPanel className="xdrSentryCard" paddingSize="m">
                     <p className="xdrSentryEyebrow">Analyst report</p>
                     <div className="xdrSentryReportGrid">
                       <div>
@@ -971,6 +1440,7 @@ export const XdrSentryApp: React.FC<Props> = ({ http, notifications }) => {
                           auditTrail: result?.auditTrail,
                           branchConclusions: result?.branchConclusions,
                           decision: result?.decision,
+                          llmTrace: result?.llmTrace,
                         },
                         null,
                         2
@@ -1019,6 +1489,109 @@ export const XdrSentryApp: React.FC<Props> = ({ http, notifications }) => {
               </EuiText>
             </EuiPanel>
           </div>
+        ) : null}
+
+        {isProviderFlyoutOpen ? (
+          <EuiFlyout onClose={closeProviderFlyout} ownFocus>
+            <EuiFlyoutHeader hasBorder>
+              <EuiTitle size="m">
+                <h2>LLM provider settings</h2>
+              </EuiTitle>
+              <EuiText size="s" color="subdued">
+                <p>Persisted server-side and reused for goal generation and investigation runs.</p>
+              </EuiText>
+            </EuiFlyoutHeader>
+
+            <EuiFlyoutBody>
+              <EuiForm component="form">
+                <EuiFormRow label="Base URL (OpenAI-compatible)">
+                  <EuiFieldText
+                    value={providerBaseUrlInput}
+                    isLoading={loadingProviderConfig}
+                    onChange={(event) => setProviderBaseUrlInput(event.target.value)}
+                    placeholder="https://api.openai.com/v1"
+                  />
+                </EuiFormRow>
+                <EuiFormRow label="Model">
+                  <EuiFieldText
+                    value={providerModelInput}
+                    isLoading={loadingProviderConfig}
+                    onChange={(event) => setProviderModelInput(event.target.value)}
+                    placeholder={DEFAULT_PROVIDER_MODEL}
+                  />
+                </EuiFormRow>
+                <EuiFormRow label="API key (leave blank to keep current)">
+                  <EuiFieldText
+                    type="text"
+                    value={providerApiKeyInput}
+                    onChange={(event) => setProviderApiKeyInput(event.target.value)}
+                    placeholder={providerConfig.hasApiKey ? 'Stored key exists' : 'sk-...'}
+                  />
+                </EuiFormRow>
+                <EuiButton onClick={testProviderConnection} isLoading={testingProviderConnection} iconType="inspect" size="s">
+                  Test LLM connection
+                </EuiButton>
+                {testingProviderConnection || providerTestActivity.length > 0 || providerTestLog ? (
+                  <>
+                    <EuiSpacer size="m" />
+                    <EuiPanel color="subdued" paddingSize="m">
+                      <EuiTitle size="xs">
+                        <h4>Connection Test Stream</h4>
+                      </EuiTitle>
+                      <EuiSpacer size="s" />
+                      {testingProviderConnection ? (
+                        <>
+                          <EuiLoadingSpinner size="m" />
+                          <EuiSpacer size="s" />
+                        </>
+                      ) : null}
+                      {providerTestActivity.length > 0 ? (
+                        <>
+                          <EuiCodeBlock language="text" fontSize="s" paddingSize="s" isCopyable={false} transparentBackground>
+                            {providerTestActivity.join('\n')}
+                          </EuiCodeBlock>
+                          <EuiSpacer size="s" />
+                        </>
+                      ) : null}
+                      {providerTestLog ? (
+                        <>
+                      <EuiText size="s">
+                        <p>
+                          {providerTestLog.testedAt} | {providerTestLog.protocol} | {providerTestLog.latencyMs} ms
+                        </p>
+                        <p>{providerTestLog.endpoint}</p>
+                      </EuiText>
+                      {providerTestLog.thinkingSummary.length > 0 ? (
+                        <>
+                          <EuiSpacer size="s" />
+                          <EuiText size="s">
+                            <strong>Thinking summary</strong>
+                            {providerTestLog.thinkingSummary.map((line, index) => (
+                              <p key={`provider-thinking-${index}`}>{`${index + 1}. ${line}`}</p>
+                            ))}
+                          </EuiText>
+                        </>
+                      ) : null}
+                      <EuiSpacer size="s" />
+                      <EuiText size="s">
+                        <strong>Response</strong>
+                        <p>{providerTestLog.response}</p>
+                      </EuiText>
+                        </>
+                      ) : null}
+                    </EuiPanel>
+                  </>
+                ) : null}
+              </EuiForm>
+            </EuiFlyoutBody>
+
+            <EuiFlyoutFooter>
+              <EuiButtonEmpty onClick={closeProviderFlyout}>Cancel</EuiButtonEmpty>
+              <EuiButton onClick={saveProviderConfig} isLoading={savingProviderConfig} fill>
+                Save provider config
+              </EuiButton>
+            </EuiFlyoutFooter>
+          </EuiFlyout>
         ) : null}
       </EuiPageBody>
     </EuiPage>

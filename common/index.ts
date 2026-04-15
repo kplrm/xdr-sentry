@@ -6,3 +6,6 @@ export const PLUGIN_CATEGORY = {
   label: 'XDR Security',
   order: 2200,
 };
+
+export const PROVIDER_CONFIG_SAVED_OBJECT_TYPE = 'xdr_sentry_provider_config';
+export const PROVIDER_CONFIG_SAVED_OBJECT_ID = 'default';

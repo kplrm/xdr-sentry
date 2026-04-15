@@ -1,3 +1,5 @@
+import { PROVIDER_CONFIG_SAVED_OBJECT_ID, PROVIDER_CONFIG_SAVED_OBJECT_TYPE } from '../common';
+
 const SOURCE_PRESETS = [
   {
     id: 'cisa-alerts',
@@ -317,9 +319,12 @@ interface AgenticFinalAnswer {
 const DEFAULT_PROVIDER_CONFIG: ProviderConfig = {
   preset: 'custom',
   baseUrl: '',
-  model: '',
+  model: 'qwen3.5:9b-q4_K_M',
   apiKey: '',
 };
+
+const OPENAI_CHAT_COMPLETIONS_PATH = '/chat/completions';
+const OPENAI_RESPONSES_PATH = '/responses';
 
 const AGENTIC_MAX_TOOL_CALLS = 16;
 
@@ -392,9 +397,16 @@ function normalizeScope(rawBody: any): ScopeInput {
 }
 
 function summarizeProvider(providerConfig: ProviderConfig): any {
+  let normalizedBaseUrl = '';
+  try {
+    normalizedBaseUrl = normalizeProviderBaseUrl(providerConfig.baseUrl);
+  } catch {
+    normalizedBaseUrl = String(providerConfig.baseUrl ?? '').trim();
+  }
+
   return {
     preset: providerConfig.preset,
-    baseUrl: providerConfig.baseUrl,
+    baseUrl: normalizedBaseUrl,
     model: providerConfig.model,
     hasApiKey: Boolean(providerConfig.apiKey),
   };
@@ -404,13 +416,273 @@ function ensureProviderIsConfigured(providerConfig: ProviderConfig): void {
   if (!providerConfig.baseUrl || !providerConfig.model || !providerConfig.apiKey) {
     throw new Error('Provider configuration is required: baseUrl, model, and apiKey must all be set.');
   }
-  if (!/^https?:\/\//i.test(providerConfig.baseUrl)) {
-    throw new Error('Provider baseUrl must be an absolute http(s) URL.');
-  }
+  normalizeProviderBaseUrl(providerConfig.baseUrl);
 }
 
-function normalizeBaseUrl(baseUrl: string): string {
-  return baseUrl.replace(/\/+$/, '');
+function normalizeProviderBaseUrl(baseUrl: string): string {
+  const raw = String(baseUrl ?? '').trim();
+  if (!raw) {
+    return '';
+  }
+
+  let parsed: URL;
+  try {
+    parsed = new URL(raw);
+  } catch {
+    throw new Error('Provider baseUrl must be an absolute http(s) URL.');
+  }
+
+  if (!['http:', 'https:'].includes(parsed.protocol)) {
+    throw new Error('Provider baseUrl must use http or https.');
+  }
+
+  let pathname = parsed.pathname.replace(/\/+$/, '');
+  if (pathname.endsWith('/v1/chat/completions')) {
+    pathname = pathname.slice(0, -'/chat/completions'.length);
+  } else if (pathname.endsWith('/chat/completions')) {
+    pathname = pathname.slice(0, -'/chat/completions'.length);
+  } else if (pathname.endsWith('/v1/responses')) {
+    pathname = pathname.slice(0, -'/responses'.length);
+  } else if (pathname.endsWith('/responses')) {
+    pathname = pathname.slice(0, -'/responses'.length);
+  }
+
+  parsed.pathname = pathname || '/';
+  parsed.search = '';
+  parsed.hash = '';
+  return parsed.toString().replace(/\/+$/, '');
+}
+
+function buildOpenAiCompatibleUrls(baseUrl: string): { normalizedBaseUrl: string; chatCompletionsUrl: string; responsesUrl: string } {
+  const normalizedBaseUrl = normalizeProviderBaseUrl(baseUrl);
+  return {
+    normalizedBaseUrl,
+    chatCompletionsUrl: `${normalizedBaseUrl}${OPENAI_CHAT_COMPLETIONS_PATH}`,
+    responsesUrl: `${normalizedBaseUrl}${OPENAI_RESPONSES_PATH}`,
+  };
+}
+
+function normalizeProviderConfigForRequest(rawBody: any, fallbackConfig?: ProviderConfig): ProviderConfig {
+  const body = parseJsonBody(rawBody);
+  const baseUrl =
+    String(body?.baseUrl ?? '').trim() || String(fallbackConfig?.baseUrl ?? '').trim();
+  const model =
+    String(body?.model ?? '').trim() ||
+    String(fallbackConfig?.model ?? '').trim() ||
+    DEFAULT_PROVIDER_CONFIG.model;
+  const apiKey =
+    String(body?.apiKey ?? '').trim() || String(fallbackConfig?.apiKey ?? '').trim();
+
+  return {
+    preset: 'custom',
+    baseUrl: normalizeProviderBaseUrl(baseUrl),
+    model,
+    apiKey,
+  };
+}
+
+function summarizeAssistantContent(content: any): string {
+  const text = typeof content === 'string' ? content : JSON.stringify(content ?? '');
+  const compact = text.replace(/\s+/g, ' ').trim();
+  if (!compact) {
+    return 'No assistant content.';
+  }
+  return compact.slice(0, 320);
+}
+
+function mapMessagesToResponsesInput(messages: any[]): any[] {
+  return messages.map((message) => {
+    const role = String(message?.role ?? 'user');
+    const textParts: string[] = [];
+
+    if (message?.content) {
+      textParts.push(typeof message.content === 'string' ? message.content : JSON.stringify(message.content));
+    }
+    if (Array.isArray(message?.tool_calls) && message.tool_calls.length > 0) {
+      textParts.push(`Tool calls: ${JSON.stringify(message.tool_calls)}`);
+    }
+    if (role === 'tool') {
+      textParts.push(`Tool name: ${String(message?.name ?? 'unknown')}`);
+    }
+
+    return {
+      role,
+      content: textParts.join('\n').trim() || ' ',
+    };
+  });
+}
+
+function adaptResponsesOutputToAssistantMessage(responseBody: any): any {
+  const output = Array.isArray(responseBody?.output) ? responseBody.output : [];
+  const responseText =
+    String(responseBody?.output_text ?? '').trim() ||
+    output
+      .flatMap((entry: any) => (Array.isArray(entry?.content) ? entry.content : []))
+      .map((entry: any) => String(entry?.text ?? '').trim())
+      .filter(Boolean)
+      .join('\n');
+
+  const toolCalls = output
+    .filter((entry: any) => entry?.type === 'function_call')
+    .map((entry: any, index: number) => ({
+      id: String(entry?.call_id ?? entry?.id ?? `responses-tool-${index + 1}`),
+      type: 'function',
+      function: {
+        name: String(entry?.name ?? ''),
+        arguments: typeof entry?.arguments === 'string' ? entry.arguments : JSON.stringify(entry?.arguments ?? {}),
+      },
+    }))
+    .filter((toolCall: any) => toolCall.function.name);
+
+  return {
+    role: 'assistant',
+    content: responseText,
+    tool_calls: toolCalls,
+  };
+}
+
+async function callProviderOpenAiCompatible(providerConfig: ProviderConfig, messages: any[], tools: any[]): Promise<any> {
+  ensureProviderIsConfigured(providerConfig);
+  const urls = buildOpenAiCompatibleUrls(providerConfig.baseUrl);
+  const headers = {
+    'content-type': 'application/json',
+    authorization: `Bearer ${providerConfig.apiKey}`,
+  };
+
+  const chatResponse = await fetch(urls.chatCompletionsUrl, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify({
+      model: providerConfig.model,
+      temperature: 0.1,
+      messages,
+      tools,
+      tool_choice: tools.length > 0 ? 'auto' : undefined,
+    }),
+  }).catch((error) => {
+    throw new Error(`Provider call failed: ${String((error as any)?.message ?? error)}`);
+  });
+
+  if (chatResponse.ok) {
+    const body = await chatResponse.json().catch(() => ({}));
+    const message = body?.choices?.[0]?.message;
+    if (!message) {
+      throw new Error('Provider returned no message choices.');
+    }
+    return {
+      message,
+      protocol: 'chat_completions',
+      endpoint: urls.chatCompletionsUrl,
+    };
+  }
+
+  const canTryResponsesFallback = [404, 405, 501].includes(chatResponse.status);
+  const chatBodyText = await chatResponse.text().catch(() => '');
+  if (!canTryResponsesFallback) {
+    throw new Error(`Provider error ${chatResponse.status}: ${chatBodyText || chatResponse.statusText}`);
+  }
+
+  const responsesResponse = await fetch(urls.responsesUrl, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify({
+      model: providerConfig.model,
+      temperature: 0.1,
+      input: mapMessagesToResponsesInput(messages),
+      tools,
+      tool_choice: tools.length > 0 ? 'auto' : undefined,
+    }),
+  }).catch((error) => {
+    throw new Error(`Provider fallback call failed: ${String((error as any)?.message ?? error)}`);
+  });
+
+  if (!responsesResponse.ok) {
+    const responsesBodyText = await responsesResponse.text().catch(() => '');
+    throw new Error(
+      `Provider chat/completions error ${chatResponse.status} and responses error ${responsesResponse.status}: ${responsesBodyText || responsesResponse.statusText}`
+    );
+  }
+
+  const responsesBody = await responsesResponse.json().catch(() => ({}));
+  return {
+    message: adaptResponsesOutputToAssistantMessage(responsesBody),
+    protocol: 'responses',
+    endpoint: urls.responsesUrl,
+  };
+}
+
+async function callProviderChatCompletionsStream(providerConfig: ProviderConfig, messages: any[]): Promise<any> {
+  ensureProviderIsConfigured(providerConfig);
+  const urls = buildOpenAiCompatibleUrls(providerConfig.baseUrl);
+  const response = await fetch(urls.chatCompletionsUrl, {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      authorization: `Bearer ${providerConfig.apiKey}`,
+    },
+    body: JSON.stringify({
+      model: providerConfig.model,
+      messages,
+      stream: true,
+    }),
+  }).catch((error) => {
+    throw new Error(`Provider streaming call failed: ${String((error as any)?.message ?? error)}`);
+  });
+
+  if (!response.ok) {
+    const bodyText = await response.text().catch(() => '');
+    throw new Error(`Provider error ${response.status}: ${bodyText || response.statusText}`);
+  }
+
+  const reader = response.body?.getReader();
+  if (!reader) {
+    throw new Error('Provider did not return a readable stream.');
+  }
+
+  const decoder = new TextDecoder();
+  let buffer = '';
+  let reasoningContent = '';
+  let answerContent = '';
+
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) {
+      break;
+    }
+
+    buffer += decoder.decode(value, { stream: true });
+    const lines = buffer.split('\n');
+    buffer = lines.pop() ?? '';
+
+    for (const rawLine of lines) {
+      const line = rawLine.trim();
+      if (!line.startsWith('data:')) {
+        continue;
+      }
+      const payload = line.slice(5).trim();
+      if (!payload || payload === '[DONE]') {
+        continue;
+      }
+
+      let parsed: any;
+      try {
+        parsed = JSON.parse(payload);
+      } catch {
+        continue;
+      }
+
+      const delta = parsed?.choices?.[0]?.delta ?? {};
+      reasoningContent += String(delta?.reasoning_content ?? delta?.reasoning ?? '');
+      answerContent += String(delta?.content ?? '');
+    }
+  }
+
+  return {
+    protocol: 'chat_completions_stream',
+    endpoint: urls.chatCompletionsUrl,
+    reasoningContent: reasoningContent.trim(),
+    answerContent: answerContent.trim(),
+  };
 }
 
 function parseModelJson(content: string): any {
@@ -468,38 +740,6 @@ function validateAgenticFinalAnswer(answer: any): AgenticFinalAnswer {
     branchConclusions,
     executiveSummary,
   };
-}
-
-async function callProviderChatCompletions(providerConfig: ProviderConfig, messages: any[], tools: any[]): Promise<any> {
-  ensureProviderIsConfigured(providerConfig);
-  const response = await fetch(`${normalizeBaseUrl(providerConfig.baseUrl)}/chat/completions`, {
-    method: 'POST',
-    headers: {
-      'content-type': 'application/json',
-      authorization: `Bearer ${providerConfig.apiKey}`,
-    },
-    body: JSON.stringify({
-      model: providerConfig.model,
-      temperature: 0.1,
-      messages,
-      tools,
-      tool_choice: 'auto',
-    }),
-  }).catch((error) => {
-    throw new Error(`Provider call failed: ${String((error as any)?.message ?? error)}`);
-  });
-
-  if (!response.ok) {
-    const bodyText = await response.text().catch(() => '');
-    throw new Error(`Provider error ${response.status}: ${bodyText || response.statusText}`);
-  }
-
-  const body = await response.json().catch(() => ({}));
-  const message = body?.choices?.[0]?.message;
-  if (!message) {
-    throw new Error('Provider returned no message choices.');
-  }
-  return message;
 }
 
 function wildcardToRegExp(pattern: string): RegExp {
@@ -1078,58 +1318,95 @@ async function buildIndexLandscape(context: any, scope: ScopeInput, goalText: st
   };
 }
 
-function buildGoalSuggestions(goalText: string, landscape: any, signals: any[]): any[] {
-  const suggestions: any[] = [];
-  const technologies = landscape?.technologies ?? [];
+function validateGoalSuggestionsResponse(value: any): any[] {
+  const goals = Array.isArray(value?.goals) ? value.goals : [];
+  const normalized = goals
+    .map((goal: any, index: number) => ({
+      id: String(goal?.id ?? `llm-goal-${index + 1}`),
+      title: String(goal?.title ?? '').trim(),
+      rationale: String(goal?.rationale ?? '').trim(),
+      sources: Array.isArray(goal?.sources) ? goal.sources.map((source: any) => String(source)).filter(Boolean) : [],
+      detectedTechnologies: Array.isArray(goal?.detectedTechnologies)
+        ? goal.detectedTechnologies.map((technology: any) => String(technology)).filter(Boolean)
+        : [],
+      confidence: String(goal?.confidence ?? '').trim().toLowerCase(),
+      scopeHint: Array.isArray(goal?.scopeHint) ? goal.scopeHint.map((item: any) => String(item)).filter(Boolean) : [],
+    }))
+    .filter((goal: any) => goal.title && goal.rationale)
+    .slice(0, 6);
 
-  for (const signal of signals.slice(0, 6)) {
-    const matchedTechnology = signal?.matchedTechnologies?.[0] ?? technologies[0] ?? 'general-security';
-    suggestions.push({
-      id: `signal-${suggestions.length + 1}`,
-      title: `Investigate ${matchedTechnology} activity related to ${signal.title}`,
-      rationale: `Derived from trusted-source research and currently profiled index families for ${matchedTechnology}.`,
-      sources: [signal.sourceUrl],
-      detectedTechnologies: signal.matchedTechnologies,
-      confidence: signal.matchedTechnologies.length > 0 ? 'medium' : 'low',
-      scopeHint: landscape?.profiles
-        ?.filter((profile: any) => signal.matchedTechnologies.includes(profile.technology))
-        .map((profile: any) => profile.index)
-        .slice(0, 5),
-    });
-  }
-
-  if (suggestions.length === 0) {
-    for (const technology of technologies.slice(0, 5)) {
-      const definition = TECHNOLOGY_DEFINITIONS[technology];
-      suggestions.push({
-        id: `tech-${technology}`,
-        title: `Validate suspicious ${technology} activity in current structured logs`,
-        rationale: `Generated from available indices and technology inference for ${technology}.`,
-        sources: [],
-        detectedTechnologies: [technology],
-        confidence: 'medium',
-        scopeHint: landscape?.profiles
-          ?.filter((profile: any) => profile.technology === technology)
-          .map((profile: any) => profile.index)
-          .slice(0, 5),
-        researchTopics: definition?.researchTopics ?? [],
-      });
+  for (const goal of normalized) {
+    if (!['low', 'medium', 'high'].includes(goal.confidence)) {
+      throw new Error(`LLM produced an invalid goal confidence value: ${goal.confidence || '(empty)'}`);
     }
   }
 
-  if (goalText && suggestions.length === 0) {
-    suggestions.push({
-      id: 'goal-refinement',
-      title: `Refine the current goal: ${goalText}`,
-      rationale: 'No clear technology-aligned suggestions were generated from the current source and index context.',
-      sources: [],
-      detectedTechnologies: technologies,
-      confidence: 'low',
-      scopeHint: [],
-    });
+  if (normalized.length === 0) {
+    throw new Error('LLM returned zero valid goal suggestions.');
   }
 
-  return suggestions;
+  return normalized;
+}
+
+async function proposeGoalsViaLlm(providerConfig: ProviderConfig, selectedGoal: string, landscape: any, signals: any[]): Promise<any> {
+  const messages = [
+    {
+      role: 'system',
+      content:
+        'You are XDR Sentry Goal Suggestion Agent. Use only the supplied index landscape and trusted-source research notes. Prioritize emerging, recent, and currently trending security threats while staying grounded in the provided data. Return strict JSON only. Schema: {"goals":[{"id":"string","title":"string","rationale":"string","sources":["string"],"detectedTechnologies":["string"],"confidence":"low|medium|high","scopeHint":["string"]}]}. Provide 3-6 distinct goals. Never add markdown or prose outside JSON.',
+    },
+    {
+      role: 'user',
+      content: JSON.stringify({
+        selectedGoal,
+        profiledIndexCount: landscape?.profiledIndexCount,
+        selectedIndexCount: landscape?.selectedIndexCount,
+        technologies: landscape?.technologies ?? [],
+        relevantProfiles: (landscape?.relevantProfiles ?? []).map((profile: any) => ({
+          index: profile.index,
+          technology: profile.technology,
+          understandable: profile.understandable,
+          fitForInvestigation: profile.fitForInvestigation,
+          meaningfulFields: (profile.meaningfulFields ?? []).slice(0, 10),
+        })),
+        researchNotes: (signals ?? []).map((note: any) => ({
+          sourceName: note.sourceName,
+          sourceUrl: note.sourceUrl,
+          title: note.title,
+          publishedHint: note.publishedHint,
+          matchedTechnologies: note.matchedTechnologies,
+        })),
+        constraints: [
+          'Prioritize goals that can be answered by current logs.',
+          'Prefer actionable goals over generic broad goals.',
+          'Include at least one goal anchored in a specific research note when notes exist.',
+          'Treat trusted-source research notes as the primary external context for selecting goals.',
+          'Prioritize recent campaign activity and threat themes (recency and trending relevance) when notes include timing hints.',
+          'Be creative by combining multiple research notes into one concrete investigation mission, but do not invent unsupported facts.',
+          'When research notes exist, each suggested goal must cite at least one sourceName in the sources array.',
+        ],
+      }),
+    },
+  ];
+
+  const call = await callProviderOpenAiCompatible(providerConfig, messages, []);
+  const parsed = parseModelJson(String(call.message?.content ?? ''));
+  const goals = validateGoalSuggestionsResponse(parsed);
+
+  return {
+    goals,
+    trace: {
+      mode: 'llm',
+      protocol: call.protocol,
+      endpoint: call.endpoint,
+      assistantSummary: summarizeAssistantContent(call.message?.content),
+      structuredPrompt: {
+        profileCount: landscape?.profiledIndexCount ?? 0,
+        technologyCount: (landscape?.technologies ?? []).length,
+        researchNoteCount: (signals ?? []).length,
+      },
+    },
+  };
 }
 
 function matchTechnologiesFromText(text: string, defaultTechnologies: string[]): string[] {
@@ -1750,6 +2027,16 @@ async function runAgenticDecisionLoop(context: any, selectedGoal: string, scope:
   };
   const client = context.core.opensearch.client.asCurrentUser;
   const toolCallsAudit: any[] = [];
+  const assistantSummaries: any[] = [];
+  const llmTrace: any = {
+    mode: 'agentic',
+    protocol: 'unknown',
+    endpoint: '',
+    iterationCount: 0,
+    assistantSummaries,
+    toolSequence: toolCallsAudit,
+    keyIntermediateDecisions: [],
+  };
 
   const tools = [
     {
@@ -1820,9 +2107,19 @@ async function runAgenticDecisionLoop(context: any, selectedGoal: string, scope:
   ];
 
   for (let iteration = 0; iteration < AGENTIC_MAX_TOOL_CALLS; iteration += 1) {
-    const assistantMessage = await callProviderChatCompletions(providerConfigStore, messages, tools);
+    const providerCall = await callProviderOpenAiCompatible(providerConfigStore, messages, tools);
+    const assistantMessage = providerCall.message;
     const assistantContent = String(assistantMessage?.content ?? '');
     const assistantToolCalls = Array.isArray(assistantMessage?.tool_calls) ? assistantMessage.tool_calls : [];
+    llmTrace.protocol = providerCall.protocol;
+    llmTrace.endpoint = providerCall.endpoint;
+    llmTrace.iterationCount = iteration + 1;
+    assistantSummaries.push({
+      step: assistantSummaries.length + 1,
+      when: nowIso(),
+      summary: summarizeAssistantContent(assistantContent),
+      requestedTools: assistantToolCalls.map((toolCall: any) => String(toolCall?.function?.name ?? 'unknown')).filter(Boolean),
+    });
 
     if (assistantToolCalls.length === 0) {
       const parsed = parseModelJson(assistantContent);
@@ -1838,6 +2135,14 @@ async function runAgenticDecisionLoop(context: any, selectedGoal: string, scope:
         branchConclusions: finalAnswer.branchConclusions,
         executiveSummary: finalAnswer.executiveSummary,
         toolCallsAudit,
+        llmTrace: {
+          ...llmTrace,
+          keyIntermediateDecisions: [
+            `Final state selected: ${finalAnswer.decision.state}`,
+            `Final confidence selected: ${finalAnswer.decision.confidence}`,
+            ...finalAnswer.decision.rationale.slice(0, 4),
+          ],
+        },
       };
     }
 
@@ -1916,6 +2221,20 @@ async function runAgenticDecisionLoop(context: any, selectedGoal: string, scope:
         step: toolCallsAudit.length + 1,
         name: toolName,
         when: nowIso(),
+        summary:
+          toolName === 'profile_indices'
+            ? `Profiled ${result?.profiledIndexCount ?? 0} index families.`
+            : toolName === 'collect_research'
+              ? `Collected ${result?.noteCount ?? 0} research notes.`
+              : toolName === 'collect_evidence'
+                ? `Collected ${result?.evidenceCount ?? 0} evidence cards.`
+                : toolName === 'build_hypotheses'
+                  ? `Generated ${result?.count ?? 0} hypotheses.`
+                  : toolName === 'challenge_hypotheses'
+                    ? `Scored ${result?.count ?? 0} challenged hypotheses.`
+                    : toolName === 'build_branches'
+                      ? `Built ${result?.branches?.length ?? 0} investigation branches.`
+                      : 'Tool completed.',
       });
 
       messages.push({
@@ -1928,6 +2247,71 @@ async function runAgenticDecisionLoop(context: any, selectedGoal: string, scope:
   }
 
   throw new Error('LLM exceeded maximum tool-call iterations without producing a final decision.');
+}
+
+function getSavedObjectsClient(context: any): any | null {
+  return context?.core?.savedObjects?.client ?? null;
+}
+
+function normalizeProviderConfigUpdate(previousConfig: ProviderConfig, rawBody: any): ProviderConfig {
+  const body = parseJsonBody(rawBody);
+  const hasApiKey = Object.prototype.hasOwnProperty.call(body ?? {}, 'apiKey');
+
+  const nextConfig: ProviderConfig = {
+    preset: String(body?.preset ?? previousConfig.preset).trim() || previousConfig.preset,
+    baseUrl: normalizeProviderBaseUrl(String(body?.baseUrl ?? previousConfig.baseUrl).trim()),
+    model: String(body?.model ?? previousConfig.model).trim() || DEFAULT_PROVIDER_CONFIG.model,
+    apiKey: hasApiKey ? String(body?.apiKey ?? '').trim() : previousConfig.apiKey,
+  };
+
+  return nextConfig;
+}
+
+async function loadProviderConfigFromSavedObjects(context: any): Promise<ProviderConfig> {
+  const client = getSavedObjectsClient(context);
+  if (!client) {
+    return providerConfigStore;
+  }
+
+  try {
+    const saved = await client.get(PROVIDER_CONFIG_SAVED_OBJECT_TYPE, PROVIDER_CONFIG_SAVED_OBJECT_ID);
+    const attributes = saved?.attributes ?? {};
+    const loaded: ProviderConfig = {
+      preset: String(attributes?.preset ?? providerConfigStore.preset).trim() || providerConfigStore.preset,
+      baseUrl: String(attributes?.baseUrl ?? providerConfigStore.baseUrl).trim(),
+      model: String(attributes?.model ?? providerConfigStore.model).trim() || DEFAULT_PROVIDER_CONFIG.model,
+      apiKey: String(attributes?.apiKey ?? providerConfigStore.apiKey).trim(),
+    };
+    providerConfigStore = loaded;
+    return loaded;
+  } catch (error: any) {
+    if (String(error?.output?.statusCode ?? error?.statusCode ?? '') === '404') {
+      return providerConfigStore;
+    }
+    throw new Error(`Failed to load provider config: ${String(error?.message ?? error)}`);
+  }
+}
+
+async function saveProviderConfigToSavedObjects(context: any, providerConfig: ProviderConfig): Promise<void> {
+  const client = getSavedObjectsClient(context);
+  if (!client) {
+    return;
+  }
+
+  await client.create(
+    PROVIDER_CONFIG_SAVED_OBJECT_TYPE,
+    {
+      preset: providerConfig.preset,
+      baseUrl: providerConfig.baseUrl,
+      model: providerConfig.model,
+      apiKey: providerConfig.apiKey,
+      updatedAt: nowIso(),
+    },
+    {
+      id: PROVIDER_CONFIG_SAVED_OBJECT_ID,
+      overwrite: true,
+    }
+  );
 }
 
 export function getBootstrap(): any {
@@ -1950,19 +2334,186 @@ export function getAgentRoles(): any[] {
   return AGENT_ROLES;
 }
 
-export function getProviderConfig(): any {
-  return summarizeProvider(providerConfigStore);
+export async function getProviderConfig(context: any): Promise<any> {
+  let loaded = providerConfigStore;
+  try {
+    loaded = await loadProviderConfigFromSavedObjects(context);
+  } catch {
+    loaded = providerConfigStore;
+  }
+  return summarizeProvider(loaded);
 }
 
-export function updateProviderConfig(rawBody: any): any {
+export async function updateProviderConfig(context: any, rawBody: any): Promise<any> {
+  let loaded = providerConfigStore;
+  try {
+    loaded = await loadProviderConfigFromSavedObjects(context);
+  } catch {
+    loaded = providerConfigStore;
+  }
+
+  providerConfigStore = normalizeProviderConfigUpdate(loaded, rawBody);
+  try {
+    await saveProviderConfigToSavedObjects(context, providerConfigStore);
+    return summarizeProvider(providerConfigStore);
+  } catch (error: any) {
+    return {
+      ...summarizeProvider(providerConfigStore),
+      persistenceWarning: `Saved object persistence failed; using in-memory provider config for this server process. ${String(
+        error?.message ?? error
+      )}`,
+    };
+  }
+}
+
+function normalizeTestThinkingSummary(value: any): string[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  return value.map((entry) => String(entry).trim()).filter(Boolean).slice(0, 6);
+}
+
+function summarizeReasoningText(text: string): string[] {
+  return text
+    .split(/\n+|(?<=[.!?])\s+/)
+    .map((entry) => entry.trim())
+    .filter(Boolean)
+    .slice(0, 6);
+}
+
+export async function testProviderConnection(context: any, rawBody: any): Promise<any> {
   const body = parseJsonBody(rawBody);
-  providerConfigStore = {
-    preset: String(body?.preset ?? providerConfigStore.preset),
-    baseUrl: String(body?.baseUrl ?? providerConfigStore.baseUrl),
-    model: String(body?.model ?? providerConfigStore.model),
-    apiKey: String(body?.apiKey ?? providerConfigStore.apiKey),
+  const question = String(body?.question ?? 'Briefly confirm connectivity and suggest one next step.').trim();
+  let savedProviderConfig = providerConfigStore;
+  try {
+    savedProviderConfig = await loadProviderConfigFromSavedObjects(context);
+  } catch {
+    savedProviderConfig = providerConfigStore;
+  }
+  const configuredProvider = normalizeProviderConfigForRequest(body, savedProviderConfig);
+  ensureProviderIsConfigured(configuredProvider);
+
+  const messages = [
+    {
+      role: 'user',
+      content: question,
+    },
+  ];
+
+  const startedAt = Date.now();
+  let protocol = 'chat_completions';
+  let endpoint = '';
+  let thinkingSummary: string[] = [];
+  let responseText = '';
+
+  try {
+    const streamed = await callProviderChatCompletionsStream(configuredProvider, messages);
+    protocol = streamed.protocol;
+    endpoint = streamed.endpoint;
+    thinkingSummary = summarizeReasoningText(streamed.reasoningContent);
+    responseText = streamed.answerContent || 'Provider returned an empty response.';
+  } catch {
+    const call = await callProviderOpenAiCompatible(configuredProvider, messages, []);
+    protocol = call.protocol;
+    endpoint = call.endpoint;
+    const assistantContent = String(call?.message?.content ?? '');
+
+    try {
+      const parsed = parseModelJson(assistantContent);
+      thinkingSummary = normalizeTestThinkingSummary(parsed?.thinkingSummary);
+      responseText = String(parsed?.response ?? '').trim();
+    } catch {
+      responseText = summarizeAssistantContent(assistantContent);
+    }
+  }
+
+  const latencyMs = Date.now() - startedAt;
+
+  if (!responseText) {
+    responseText = 'Provider returned an empty response.';
+  }
+
+  return {
+    testedAt: nowIso(),
+    protocol,
+    endpoint,
+    latencyMs,
+    thinkingSummary,
+    response: responseText,
   };
-  return summarizeProvider(providerConfigStore);
+}
+
+export async function getProviderAvailability(context: any): Promise<any> {
+  let savedProviderConfig = providerConfigStore;
+  try {
+    savedProviderConfig = await loadProviderConfigFromSavedObjects(context);
+  } catch {
+    savedProviderConfig = providerConfigStore;
+  }
+
+  try {
+    ensureProviderIsConfigured(savedProviderConfig);
+  } catch (error: any) {
+    return {
+      available: false,
+      reason: String(error?.message ?? 'Provider configuration is not valid.'),
+      endpoint: '',
+      latencyMs: 0,
+    };
+  }
+
+  const urls = buildOpenAiCompatibleUrls(savedProviderConfig.baseUrl);
+  const startedAt = Date.now();
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 60000);
+
+  try {
+    const response = await fetch(urls.chatCompletionsUrl, {
+      method: 'POST',
+      signal: controller.signal,
+      headers: {
+        'content-type': 'application/json',
+        authorization: `Bearer ${savedProviderConfig.apiKey}`,
+      },
+      body: JSON.stringify({
+        model: savedProviderConfig.model,
+        temperature: 0,
+        max_tokens: 1,
+        messages: [{ role: 'user', content: 'Return exactly: ok' }],
+      }),
+    });
+
+    const latencyMs = Date.now() - startedAt;
+    if (!response.ok) {
+      const bodyText = await response.text().catch(() => '');
+      return {
+        available: false,
+        reason: `LLM provider responded ${response.status}: ${(bodyText || response.statusText || 'unknown error').slice(0, 220)}`,
+        endpoint: urls.chatCompletionsUrl,
+        latencyMs,
+      };
+    }
+
+    return {
+      available: true,
+      reason: 'LLM provider is reachable.',
+      endpoint: urls.chatCompletionsUrl,
+      latencyMs,
+    };
+  } catch (error: any) {
+    const latencyMs = Date.now() - startedAt;
+    const isAbort = String(error?.name ?? '').toLowerCase() === 'aborterror';
+    return {
+      available: false,
+      reason: isAbort
+        ? 'LLM availability check timed out after 60s.'
+        : `LLM availability check failed: ${String(error?.message ?? error)}`,
+      endpoint: urls.chatCompletionsUrl,
+      latencyMs,
+    };
+  } finally {
+    clearTimeout(timeout);
+  }
 }
 
 export async function getIndexProfile(context: any, rawBody: any): Promise<any> {
@@ -1982,11 +2533,15 @@ export async function proposeGoals(context: any, rawBody: any): Promise<any> {
   const enabledSources = normalizeSources(body);
   const landscape = await buildIndexLandscape(context, scope, selectedGoal);
   const signals = await buildResearchNotes(enabledSources, selectedGoal, landscape.technologies);
-  const goals = buildGoalSuggestions(selectedGoal, landscape, signals);
+  const configuredProvider = await loadProviderConfigFromSavedObjects(context);
+  ensureProviderIsConfigured(configuredProvider);
+  const llmGoals = await proposeGoalsViaLlm(configuredProvider, selectedGoal, landscape, signals);
+
   return {
-    goals,
+    goals: llmGoals.goals,
     signals,
     landscape,
+    goalGenerationTrace: llmGoals.trace,
   };
 }
 
@@ -2009,10 +2564,12 @@ export async function runInvestigation(context: any, rawBody: any): Promise<any>
     throw new Error('An investigation goal is required before execution.');
   }
 
-  ensureProviderIsConfigured(providerConfigStore);
+  const configuredProvider = await loadProviderConfigFromSavedObjects(context);
+  ensureProviderIsConfigured(configuredProvider);
 
   const scope = normalizeScope(body);
   const enabledSources = normalizeSources(body);
+  providerConfigStore = configuredProvider;
   const agentic = await runAgenticDecisionLoop(context, selectedGoal, scope, enabledSources);
   const landscape = agentic.landscape;
   const researchNotes = agentic.researchNotes;
@@ -2053,6 +2610,7 @@ export async function runInvestigation(context: any, rawBody: any): Promise<any>
     challenges,
     auditTrail,
     toolCalls: agentic.toolCallsAudit,
+    llmTrace: agentic.llmTrace,
     branchConclusions,
     decision,
     graph,

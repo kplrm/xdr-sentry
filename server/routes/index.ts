@@ -2,14 +2,17 @@ import {
   getAgentRoles,
   getBootstrap,
   getIndexProfile,
+  getProviderAvailability,
   getProviderConfig,
   getSourcePresets,
   listInvestigations,
   previewInvestigation,
   proposeGoals,
   runInvestigation,
+  testProviderConnection,
   updateProviderConfig,
 } from '../investigation_engine';
+import { schema } from '@osd/config-schema';
 
 export function registerSentryRoutes(router: any): void {
   router.get(
@@ -44,7 +47,7 @@ export function registerSentryRoutes(router: any): void {
     {
       path: '/api/xdr_sentry/index_profile',
       validate: {
-        body: (value: any) => value,
+        body: schema.any(),
       },
     },
     async (context: any, request: any, response: any) => {
@@ -64,15 +67,24 @@ export function registerSentryRoutes(router: any): void {
     {
       path: '/api/xdr_sentry/provider_config',
       validate: {
-        body: (value: any) => value,
+        body: schema.any(),
       },
     },
-    async (_context: any, request: any, response: any) => {
-      return response.ok({
-        body: {
-          provider: updateProviderConfig(request.body),
-        },
-      });
+    async (context: any, request: any, response: any) => {
+      try {
+        const provider = await updateProviderConfig(context, request.body);
+        return response.ok({
+          body: {
+            provider,
+          },
+        });
+      } catch (error: any) {
+        const message = String(error?.message ?? 'unknown error');
+        return response.customError({
+          statusCode: /invalid|required|must/i.test(message) ? 400 : 500,
+          body: { message: `Failed to save provider config: ${message}` },
+        });
+      }
     }
   );
 
@@ -81,12 +93,59 @@ export function registerSentryRoutes(router: any): void {
       path: '/api/xdr_sentry/provider_config',
       validate: false,
     },
-    async (_context: any, _request: any, response: any) => {
-      return response.ok({
-        body: {
-          provider: getProviderConfig(),
-        },
-      });
+    async (context: any, _request: any, response: any) => {
+      try {
+        const provider = await getProviderConfig(context);
+        return response.ok({
+          body: {
+            provider,
+          },
+        });
+      } catch (error: any) {
+        return response.customError({
+          statusCode: 500,
+          body: { message: `Failed to load provider config: ${String(error?.message ?? 'unknown error')}` },
+        });
+      }
+    }
+  );
+
+  router.get(
+    {
+      path: '/api/xdr_sentry/provider_availability',
+      validate: false,
+    },
+    async (context: any, _request: any, response: any) => {
+      try {
+        const result = await getProviderAvailability(context);
+        return response.ok({ body: result });
+      } catch (error: any) {
+        return response.customError({
+          statusCode: 500,
+          body: { message: `Failed to check provider availability: ${String(error?.message ?? 'unknown error')}` },
+        });
+      }
+    }
+  );
+
+  router.post(
+    {
+      path: '/api/xdr_sentry/test_provider',
+      validate: {
+        body: schema.any(),
+      },
+    },
+    async (context: any, request: any, response: any) => {
+      try {
+        const result = await testProviderConnection(context, request.body);
+        return response.ok({ body: result });
+      } catch (error: any) {
+        const message = String(error?.message ?? 'unknown error');
+        return response.customError({
+          statusCode: /invalid|required|must/i.test(message) ? 400 : 500,
+          body: { message: `Failed to test provider connection: ${message}` },
+        });
+      }
     }
   );
 
@@ -94,7 +153,7 @@ export function registerSentryRoutes(router: any): void {
     {
       path: '/api/xdr_sentry/propose_goals',
       validate: {
-        body: (value: any) => value,
+        body: schema.any(),
       },
     },
     async (context: any, request: any, response: any) => {
@@ -114,7 +173,7 @@ export function registerSentryRoutes(router: any): void {
     {
       path: '/api/xdr_sentry/investigation_preview',
       validate: {
-        body: (value: any) => value,
+        body: schema.any(),
       },
     },
     async (context: any, request: any, response: any) => {
@@ -134,7 +193,7 @@ export function registerSentryRoutes(router: any): void {
     {
       path: '/api/xdr_sentry/run_investigation',
       validate: {
-        body: (value: any) => value,
+        body: schema.any(),
       },
     },
     async (context: any, request: any, response: any) => {
